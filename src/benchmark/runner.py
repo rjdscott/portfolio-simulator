@@ -269,7 +269,7 @@ def run_benchmark(
 
             # Phase 3: Compute metrics
             t2 = time.perf_counter()
-            if engine_name == "numpy_matmul":
+            if engine_name in ("numpy_matmul", "numpy_vectorised"):
                 results = compute_numpy_matmul(returns, weights)
             elif engine_name == "pandas_baseline":
                 results = compute_pandas_row_loop(returns, weights, tickers)

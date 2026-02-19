@@ -59,8 +59,20 @@ def fetch_sp500_constituents() -> pd.DataFrame:
     Returns a DataFrame with columns:
         ticker, name, sector, sub_industry, cik
     """
+    import io
+    import requests
+
     log.info("Fetching S&P 500 constituent list from Wikipedia...")
-    tables = pd.read_html(WIKIPEDIA_SP500_URL, header=0)
+    # Wikipedia blocks the default urllib User-Agent; use a browser-like one
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    resp = requests.get(WIKIPEDIA_SP500_URL, headers=headers, timeout=30)
+    resp.raise_for_status()
+    tables = pd.read_html(io.StringIO(resp.text), header=0)
     df = tables[0]
 
     # Wikipedia column names vary slightly over time — normalise them
