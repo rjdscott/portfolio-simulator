@@ -16,11 +16,29 @@ venv/
 env/
 ENV/
 
+# Testing & coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
+
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 .DS_Store
 
 # Jupyter
@@ -34,6 +52,14 @@ data/parquet/
 data/arrow/
 data/hdf5/
 data/zarr/
+data/processed/
+
+# Binary data formats
+*.parquet
+*.arrow
+*.feather
+*.h5
+*.hdf5
 
 # Keep metadata (constituent list, manifest, validation report)
 !data/raw/metadata/
@@ -41,9 +67,9 @@ data/zarr/
 !data/raw/metadata/*.json
 !data/raw/.gitkeep
 
-# Results — keep the summary CSV, gitignore individual run JSONs for now
-# (change this policy when publishing specific results)
+# Results — keep the summary CSV and .gitkeep, ignore individual run JSONs
 results/*.json
+!results/.gitkeep
 
 # Build artifacts
 cpp/build/
@@ -55,9 +81,18 @@ implementations/rust/*/target/
 implementations/kotlin/*/.gradle/
 implementations/kotlin/*/build/
 
+# Compiled extensions and native libraries
+*.so
+*.dylib
+*.dll
+
 # Compiled Java
 *.class
 *.jar
+
+# Logs
+*.log
+logs/
 
 # OS
 Thumbs.db
