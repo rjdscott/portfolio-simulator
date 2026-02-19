@@ -5,12 +5,11 @@ Loads the shared library on first call and exposes a Python-friendly interface.
 
 Usage
 -----
-    from portfolio_rayon import compute_rust_rayon
+    from src.compute.rust_rayon import compute_rust_rayon
     results = compute_rust_rayon(returns, weights)  # (N, 2) float64
 
 Build the library first:
-    make -C implementations/rust/rayon/
-    # or: cd implementations/rust/rayon && cargo build --release
+    cargo build --release --manifest-path implementations/rust/rayon/Cargo.toml
 """
 
 from __future__ import annotations
@@ -20,9 +19,15 @@ from pathlib import Path
 
 import numpy as np
 
-# Shared library: ../target/release/libportfolio_rayon.so
+# src/compute/ → project root → implementations/rust/rayon/target/release/
 _SO_PATH = (
-    Path(__file__).resolve().parent.parent / "target" / "release" / "libportfolio_rayon.so"
+    Path(__file__).resolve().parent.parent.parent
+    / "implementations"
+    / "rust"
+    / "rayon"
+    / "target"
+    / "release"
+    / "libportfolio_rayon.so"
 )
 
 _lib: ctypes.CDLL | None = None
@@ -37,8 +42,7 @@ def _load_lib() -> ctypes.CDLL:
         raise FileNotFoundError(
             f"Shared library not found: {_SO_PATH}\n"
             "Build it with:\n"
-            "  make -C implementations/rust/rayon/\n"
-            "  # or: cd implementations/rust/rayon && cargo build --release"
+            "  cargo build --release --manifest-path implementations/rust/rayon/Cargo.toml"
         )
 
     lib = ctypes.CDLL(str(_SO_PATH))

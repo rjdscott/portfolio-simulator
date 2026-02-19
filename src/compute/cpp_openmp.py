@@ -5,23 +5,30 @@ Loads the shared library on first call and exposes a Python-friendly interface.
 
 Usage
 -----
-    from portfolio_openmp import compute_cpp_openmp
+    from src.compute.cpp_openmp import compute_cpp_openmp
     results = compute_cpp_openmp(returns, weights)  # (N, 2) float64
 
 Build the library first:
-    make -C implementations/cpp/openmp/
+    cmake -S implementations/cpp/openmp -B implementations/cpp/openmp/build -DCMAKE_BUILD_TYPE=Release
+    cmake --build implementations/cpp/openmp/build --parallel
 """
 
 from __future__ import annotations
 
 import ctypes
-import os
 from pathlib import Path
 
 import numpy as np
 
-# Shared library path relative to this file: ../build/libportfolio_openmp.so
-_SO_PATH = Path(__file__).resolve().parent.parent / "build" / "libportfolio_openmp.so"
+# src/compute/ → project root → implementations/cpp/openmp/build/
+_SO_PATH = (
+    Path(__file__).resolve().parent.parent.parent
+    / "implementations"
+    / "cpp"
+    / "openmp"
+    / "build"
+    / "libportfolio_openmp.so"
+)
 
 _lib: ctypes.CDLL | None = None
 
@@ -35,7 +42,9 @@ def _load_lib() -> ctypes.CDLL:
         raise FileNotFoundError(
             f"Shared library not found: {_SO_PATH}\n"
             "Build it with:\n"
-            "  make -C implementations/cpp/openmp/"
+            "  cmake -S implementations/cpp/openmp -B implementations/cpp/openmp/build "
+            "-DCMAKE_BUILD_TYPE=Release\n"
+            "  cmake --build implementations/cpp/openmp/build --parallel"
         )
 
     lib = ctypes.CDLL(str(_SO_PATH))

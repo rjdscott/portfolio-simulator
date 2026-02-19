@@ -331,14 +331,10 @@ def _make_run_fn(storage: str, engine: str, port_df: pd.DataFrame):
             from src.compute.numba_parallel import compute_numba_parallel
             results = compute_numba_parallel(returns, weights)
         elif engine == "cpp_openmp":
-            import sys as _sys
-            _sys.path.insert(0, str(ROOT / "implementations" / "cpp" / "openmp" / "python"))
-            from portfolio_openmp import compute_cpp_openmp
+            from src.compute.cpp_openmp import compute_cpp_openmp
             results = compute_cpp_openmp(returns, weights)
         elif engine == "rust_rayon":
-            import sys as _sys
-            _sys.path.insert(0, str(ROOT / "implementations" / "rust" / "rayon" / "python"))
-            from portfolio_rayon import compute_rust_rayon
+            from src.compute.rust_rayon import compute_rust_rayon
             results = compute_rust_rayon(returns, weights)
         elif engine == "cupy_gpu":
             from src.compute.cupy_gpu import compute_cupy_gpu
