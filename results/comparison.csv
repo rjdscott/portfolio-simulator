@@ -2,7 +2,10 @@ phase,implementation,storage_format,N=100,"N=1,000","N=100,000","N=1,000,000"
 1_csv_baseline,numpy_vectorised,csv_per_stock,1242.39,11797.46,154373.64,173593.03
 1_csv_baseline,numpy_vectorised,csv_wide,7732.76,66507.05,173893.99,178390.9
 1_csv_baseline,pandas_baseline,csv_per_stock,1430.45,11669.56,,
+2_storage_opt,cpp_openmp,parquet_wide_uncompressed,25980.77,174641.98,859223.44,862918.0349999999
+2_storage_opt,numba_parallel,parquet_wide_uncompressed,24119.63,187869.905,839200.75,919968.28
 2_storage_opt,numpy_vectorised,parquet_per_stock,1389.6,13532.17,166720.57,176590.96
 2_storage_opt,numpy_vectorised,parquet_wide_snappy,9737.1,56123.02,175895.0,175987.77
-2_storage_opt,numpy_vectorised,parquet_wide_uncompressed,20193.86,48904.54,174485.96,176456.35
+2_storage_opt,numpy_vectorised,parquet_wide_uncompressed,20193.86,53395.83,172246.635,177014.10499999998
 2_storage_opt,numpy_vectorised,parquet_wide_zstd,5480.35,48550.76,174981.19,176506.52
+2_storage_opt,rust_rayon,parquet_wide_uncompressed,22281.64,115361.06,454930.08,474932.13

@@ -94,7 +94,30 @@ for _storage in (
         PHASE2_CONFIGS.append({**_BASE, "storage_format": _storage, "portfolio_scale": _scale})
 
 
-ALL_PHASES = {1: PHASE1_CONFIGS, 2: PHASE2_CONFIGS}
+# ---------------------------------------------------------------------------
+# Phase 3: Compute engine comparison — storage fixed at parquet_wide_uncompressed
+# 4 engines × 4 scales = 16 configurations
+# ---------------------------------------------------------------------------
+PHASE3_CONFIGS = [
+    {
+        "implementation": eng,
+        "language": lang,
+        "storage_format": "parquet_wide_uncompressed",
+        "portfolio_scale": scale,
+        "portfolio_k": 15,
+        "universe_size": 100,
+        "seed": 42,
+    }
+    for eng, lang in [
+        ("numba_parallel", "python"),
+        ("cpp_openmp",     "cpp"),
+        ("rust_rayon",     "rust"),
+        ("cupy_gpu",       "python"),
+    ]
+    for scale in (100, 1_000, 100_000, 1_000_000)
+]
+
+ALL_PHASES = {1: PHASE1_CONFIGS, 2: PHASE2_CONFIGS, 3: PHASE3_CONFIGS}
 
 
 def _run_phase(phase_num: int, configs: list[dict], args) -> None:
@@ -109,7 +132,11 @@ def _run_phase(phase_num: int, configs: list[dict], args) -> None:
                 drop_cache=not args.no_drop_cache,
             )
         except FileNotFoundError as e:
-            log.error(str(e))
+            log.error(f"SKIP — {e}")
+        except (ImportError, RuntimeError) as e:
+            log.warning(
+                f"SKIP — {cfg['implementation']} | N={cfg['portfolio_scale']:,} — {e}"
+            )
 
 
 def main():
@@ -125,8 +152,14 @@ def main():
                         }),
                         default="csv_wide")
     parser.add_argument("--engine",
-                        choices=["numpy_vectorised", "numpy_matmul",
-                                 "pandas_baseline", "numba_parallel", "cupy_gpu"],
+                        choices=[
+                            "numpy_vectorised", "numpy_matmul",
+                            "pandas_baseline",
+                            "numba_parallel",
+                            "cpp_openmp",
+                            "rust_rayon",
+                            "cupy_gpu",
+                        ],
                         default="numpy_vectorised")
     parser.add_argument("--reps", type=int, default=5,
                         help="Number of timed repetitions (default: 5)")
@@ -135,7 +168,7 @@ def main():
     parser.add_argument("--no-drop-cache", action="store_true",
                         help="Do not drop OS page cache between runs")
     parser.add_argument("--phase", type=int, action="append",
-                        choices=[1, 2], dest="phases",
+                        choices=[1, 2, 3], dest="phases",
                         help="Run all configurations in a phase (repeatable: --phase 1 --phase 2)")
     parser.add_argument("--report", action="store_true",
                         help="Print aggregated report of all results and exit")
@@ -162,9 +195,13 @@ def main():
         parser.error("--scale is required (unless using --phase or --report)")
 
     scale = SCALE_MAP[args.scale]
+    _engine_language = {
+        "cpp_openmp": "cpp",
+        "rust_rayon": "rust",
+    }
     config = {
         "implementation": args.engine,
-        "language": "python",
+        "language": _engine_language.get(args.engine, "python"),
         "storage_format": args.storage,
         "portfolio_scale": scale,
         "portfolio_k": 15,

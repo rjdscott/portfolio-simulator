@@ -84,6 +84,9 @@ def capture_software() -> dict:
         "kernel_version": platform.version(),
         "python_version": platform.python_version(),
         "implementation_version": _git_sha(),
+        # Parallelism settings for Phase 3 engines
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "numba_num_threads": os.environ.get("NUMBA_NUM_THREADS"),
     }
     for pkg, key in [
         ("numpy", "numpy_version"),
@@ -324,6 +327,22 @@ def _make_run_fn(storage: str, engine: str, port_df: pd.DataFrame):
             results = compute_numpy_matmul(returns, weights)
         elif engine == "pandas_baseline":
             results = compute_pandas_row_loop(returns, weights, tickers)
+        elif engine == "numba_parallel":
+            from src.compute.numba_parallel import compute_numba_parallel
+            results = compute_numba_parallel(returns, weights)
+        elif engine == "cpp_openmp":
+            import sys as _sys
+            _sys.path.insert(0, str(ROOT / "implementations" / "cpp" / "openmp" / "python"))
+            from portfolio_openmp import compute_cpp_openmp
+            results = compute_cpp_openmp(returns, weights)
+        elif engine == "rust_rayon":
+            import sys as _sys
+            _sys.path.insert(0, str(ROOT / "implementations" / "rust" / "rayon" / "python"))
+            from portfolio_rayon import compute_rust_rayon
+            results = compute_rust_rayon(returns, weights)
+        elif engine == "cupy_gpu":
+            from src.compute.cupy_gpu import compute_cupy_gpu
+            results = compute_cupy_gpu(returns, weights)
         else:
             raise ValueError(f"Unknown engine: '{engine}'")
         pt.stop("compute_metrics")

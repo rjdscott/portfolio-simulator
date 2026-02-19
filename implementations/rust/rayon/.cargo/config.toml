@@ -1,0 +1,5 @@
+[build]
+# Compile for the host CPU so LLVM can emit AVX2 + FMA instructions.
+# Without this Rust targets the SSE2 baseline (x86_64 minimum), which halves
+# throughput on dot-product reductions vs the AVX2 path on Haswell+.
+rustflags = ["-C", "target-cpu=native"]
