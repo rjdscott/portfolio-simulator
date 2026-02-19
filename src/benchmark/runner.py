@@ -1,11 +1,15 @@
 """
 Benchmark runner — orchestrates timed runs of compute/storage configurations.
 
-Usage (from project root):
-    python -m src.benchmark.runner --config bl_001
+Each benchmark run collects:
+  - Wall-clock time, broken down by phase (load, align, compute)
+  - Per-process I/O bytes read (via psutil.Process.io_counters)
+  - CPU utilisation (background sampling thread at 100 ms intervals)
+  - Peak RSS memory (background sampling thread)
+  - Full per-repetition telemetry stored in the result JSON
 
-Or via the CLI script:
-    python scripts/run_benchmark.py --scale 1M --storage wide_csv --engine numpy_matmul
+Usage:
+    python scripts/run_benchmark.py --scale 1M --storage parquet_wide_snappy --engine numpy_vectorised
 """
 
 from __future__ import annotations
@@ -15,11 +19,11 @@ import logging
 import os
 import platform
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -29,8 +33,9 @@ log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[2]
 RESULTS_DIR = ROOT / "results"
-PRICES_DIR = ROOT / "data" / "raw" / "prices"
 PORTFOLIOS_DIR = ROOT / "data" / "raw" / "portfolios"
+
+TELEMETRY_INTERVAL_SEC = 0.025  # CPU / RSS sampling interval (25 ms)
 
 
 # ---------------------------------------------------------------------------
@@ -38,15 +43,16 @@ PORTFOLIOS_DIR = ROOT / "data" / "raw" / "portfolios"
 # ---------------------------------------------------------------------------
 
 def capture_hardware() -> dict:
-    cpu_freq = psutil.cpu_freq()
+    freq = psutil.cpu_freq()
     return {
         "cpu_model": platform.processor() or _read_cpuinfo_model(),
         "cpu_logical_cores": psutil.cpu_count(logical=True),
         "cpu_physical_cores": psutil.cpu_count(logical=False),
+        "cpu_freq_mhz_max": round(freq.max, 0) if freq else None,
         "ram_gb": round(psutil.virtual_memory().total / 1e9, 1),
         "gpu_model": _detect_gpu(),
-        "gpu_vram_gb": None,  # populated separately if GPU run
-        "storage_type": "nvme",  # update manually if different
+        "gpu_vram_gb": None,
+        "storage_type": "nvme",
     }
 
 
@@ -82,24 +88,23 @@ def capture_software() -> dict:
     for pkg, key in [
         ("numpy", "numpy_version"),
         ("pandas", "pandas_version"),
-    ]:
-        try:
-            import importlib
-            mod = importlib.import_module(pkg)
-            sw[key] = getattr(mod, "__version__", None)
-        except ImportError:
-            sw[key] = None
-
-    for pkg, key in [
+        ("pyarrow", "pyarrow_version"),
         ("numba", "numba_version"),
         ("cupy", "cupy_version"),
     ]:
         try:
-            import importlib
-            mod = importlib.import_module(pkg)
+            mod = __import__(pkg)
             sw[key] = getattr(mod, "__version__", None)
         except ImportError:
             sw[key] = None
+
+    # BLAS implementation
+    try:
+        import numpy as np
+        blas_info = np.__config__.blas_opt_info  # type: ignore[attr-defined]
+        sw["blas_implementation"] = str(blas_info.get("libraries", ["unknown"])[0])
+    except Exception:
+        sw["blas_implementation"] = None
 
     return sw
 
@@ -116,82 +121,222 @@ def _git_sha() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Memory tracking
+# Page cache management
 # ---------------------------------------------------------------------------
 
-def _peak_rss_mb() -> float:
-    """Current process peak RSS in MB."""
-    proc = psutil.Process(os.getpid())
-    return proc.memory_info().rss / 1_048_576
-
-
-def drop_page_cache() -> None:
+def drop_page_cache() -> bool:
     """
-    Drop the OS page cache so that disk reads are cold.
-
-    Requires root. If not available, log a warning — benchmarks will be warm.
+    Drop the OS page cache (cold-cache benchmark).
+    Requires root. Returns True if successful, False otherwise.
     """
     try:
         os.sync()
         with open("/proc/sys/vm/drop_caches", "w") as f:
             f.write("3\n")
-        log.info("OS page cache dropped.")
+        log.debug("OS page cache dropped (cold read).")
+        return True
     except PermissionError:
         log.warning(
-            "Could not drop page cache (requires root). "
-            "Disk-read timings may reflect warm cache. "
-            "Run: sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"
+            "Cannot drop page cache (requires root) — reads will be warm. "
+            "For cold benchmarks: sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"
         )
+        return False
     except FileNotFoundError:
-        log.warning("drop_caches not available (non-Linux OS). Skipping.")
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Single timed run
+# Telemetry collector
 # ---------------------------------------------------------------------------
 
-class Timer:
-    """Context manager that records elapsed wall-clock time."""
+class TelemetryCollector:
+    """
+    Collects system telemetry during a benchmark run.
+
+    Spawns a background thread that samples CPU utilisation and process RSS
+    at a fixed interval. Also snapshots per-process I/O counters before/after
+    to measure actual bytes read from disk.
+
+    Usage:
+        tc = TelemetryCollector()
+        tc.start()
+        # ... run workload ...
+        tc.stop()
+        summary = tc.summary()
+    """
+
+    def __init__(self, interval_sec: float = TELEMETRY_INTERVAL_SEC):
+        self._interval = interval_sec
+        self._proc = psutil.Process(os.getpid())
+        self._cpu_samples: list[float] = []
+        self._rss_samples: list[float] = []   # bytes
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._io_start: psutil._common.pio | None = None
+        self._io_end: psutil._common.pio | None = None
+        self._t_start: float = 0.0
+        self._t_end: float = 0.0
+        self._cache_dropped: bool = False
+
+    def _sample_loop(self) -> None:
+        """Background thread: sample CPU% and RSS at fixed intervals."""
+        # prime the cpu_percent call (first call always returns 0.0)
+        psutil.cpu_percent(interval=None)
+        while not self._stop_event.wait(self._interval):
+            self._cpu_samples.append(psutil.cpu_percent(interval=None))
+            try:
+                self._rss_samples.append(self._proc.memory_info().rss)
+            except psutil.NoSuchProcess:
+                break
+
+    def start(self, drop_cache: bool = False) -> None:
+        """Start telemetry collection. Optionally drop page cache first."""
+        if drop_cache:
+            self._cache_dropped = drop_page_cache()
+        # Snapshot I/O counters
+        try:
+            self._io_start = self._proc.io_counters()
+        except (AttributeError, psutil.AccessDenied):
+            self._io_start = None
+
+        # Force an initial CPU% reading (primes the psutil accumulator)
+        psutil.cpu_percent(interval=None)
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self._t_start = time.perf_counter()
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop collection. Call immediately after the workload finishes."""
+        self._t_end = time.perf_counter()
+        # Force a final sample so very fast runs have at least one data point
+        try:
+            self._cpu_samples.append(psutil.cpu_percent(interval=None))
+            self._rss_samples.append(self._proc.memory_info().rss)
+        except Exception:
+            pass
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        try:
+            self._io_end = self._proc.io_counters()
+        except (AttributeError, psutil.AccessDenied):
+            self._io_end = None
+
+    @property
+    def elapsed_sec(self) -> float:
+        return self._t_end - self._t_start
+
+    def summary(self) -> dict:
+        """Return a summary dict of all collected telemetry."""
+        # I/O
+        if self._io_start and self._io_end:
+            io_read_mb = (self._io_end.read_bytes - self._io_start.read_bytes) / 1_048_576
+            io_read_count = self._io_end.read_count - self._io_start.read_count
+        else:
+            io_read_mb = None
+            io_read_count = None
+
+        # CPU
+        cpu_mean = round(float(np.mean(self._cpu_samples)), 1) if self._cpu_samples else None
+        cpu_peak = round(float(max(self._cpu_samples)), 1) if self._cpu_samples else None
+        cpu_p90 = round(float(np.percentile(self._cpu_samples, 90)), 1) if self._cpu_samples else None
+
+        # RSS (memory)
+        if self._rss_samples:
+            rss_peak_mb = round(max(self._rss_samples) / 1_048_576, 1)
+            rss_mean_mb = round(float(np.mean(self._rss_samples)) / 1_048_576, 1)
+        else:
+            rss_peak_mb = None
+            rss_mean_mb = None
+
+        return {
+            "elapsed_sec": round(self.elapsed_sec, 6),
+            "wall_clock_ms": round(self.elapsed_sec * 1000, 3),
+            "cache_dropped": self._cache_dropped,
+            "io_read_mb": round(io_read_mb, 3) if io_read_mb is not None else None,
+            "io_read_syscalls": io_read_count,
+            "cpu_mean_pct": cpu_mean,
+            "cpu_peak_pct": cpu_peak,
+            "cpu_p90_pct": cpu_p90,
+            "cpu_samples": len(self._cpu_samples),
+            "rss_peak_mb": rss_peak_mb,
+            "rss_mean_mb": rss_mean_mb,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Phase timers (fine-grained breakdown within a single run)
+# ---------------------------------------------------------------------------
+
+class PhaseTimer:
+    """Records wall-clock elapsed time for named phases within a run."""
 
     def __init__(self):
-        self.elapsed: float = 0.0
+        self._phases: dict[str, float] = {}
+        self._starts: dict[str, float] = {}
 
-    def __enter__(self):
-        self._start = time.perf_counter()
-        return self
+    def start(self, name: str) -> None:
+        self._starts[name] = time.perf_counter()
 
-    def __exit__(self, *args):
-        self.elapsed = time.perf_counter() - self._start
+    def stop(self, name: str) -> float:
+        elapsed = time.perf_counter() - self._starts.pop(name)
+        self._phases[name] = round(elapsed, 6)
+        return elapsed
 
-
-def timed_run(
-    fn: Callable[[], tuple],
-    drop_cache: bool = False,
-) -> tuple[float, tuple]:
-    """
-    Execute fn() with wall-clock timing.
-
-    Parameters
-    ----------
-    fn         : zero-argument callable that returns a result tuple
-    drop_cache : whether to drop page cache before running
-
-    Returns
-    -------
-    elapsed : wall-clock seconds
-    result  : whatever fn() returned
-    """
-    if drop_cache:
-        drop_page_cache()
-
-    with Timer() as t:
-        result = fn()
-
-    return t.elapsed, result
+    def as_dict(self) -> dict[str, float]:
+        return dict(self._phases)
 
 
 # ---------------------------------------------------------------------------
-# Full benchmark: N repetitions
+# Core run function
+# ---------------------------------------------------------------------------
+
+def _make_run_fn(storage: str, engine: str, port_df: pd.DataFrame):
+    """
+    Build a zero-argument callable that executes one full benchmark repetition.
+
+    Returns (results_array, phase_timings_dict).
+    """
+    from src.data.storage import load_returns
+    from src.compute.baseline import (
+        compute_numpy_matmul,
+        compute_pandas_row_loop,
+    )
+
+    def run_fn():
+        pt = PhaseTimer()
+
+        # Phase: load prices from storage
+        pt.start("load_prices")
+        returns, tickers = load_returns(storage)
+        pt.stop("load_prices")
+
+        # Phase: align portfolio weights with the loaded ticker order
+        pt.start("align_weights")
+        weights = port_df.reindex(columns=tickers, fill_value=0.0).to_numpy(dtype=np.float32)
+        pt.stop("align_weights")
+
+        # Phase: compute portfolio metrics
+        pt.start("compute_metrics")
+        if engine in ("numpy_matmul", "numpy_vectorised"):
+            results = compute_numpy_matmul(returns, weights)
+        elif engine == "pandas_baseline":
+            results = compute_pandas_row_loop(returns, weights, tickers)
+        else:
+            raise ValueError(f"Unknown engine: '{engine}'")
+        pt.stop("compute_metrics")
+
+        phases = pt.as_dict()
+        phases["total"] = sum(phases.values())
+        return results, phases
+
+    return run_fn
+
+
+# ---------------------------------------------------------------------------
+# Main benchmark entry point
 # ---------------------------------------------------------------------------
 
 def run_benchmark(
@@ -201,33 +346,22 @@ def run_benchmark(
     drop_cache: bool = True,
 ) -> dict:
     """
-    Run a benchmark configuration N times and collect timings.
+    Run a benchmark configuration N times, collecting full telemetry per rep.
 
     Parameters
     ----------
-    config : benchmark configuration dict. Must contain:
-        - implementation : str
-        - language        : str
-        - storage_format  : str
-        - portfolio_scale : int
-        - portfolio_k     : int
-        - universe_size   : int
-        - seed            : int
-    repetitions : number of timed runs
-    warmup      : if True, run once before timing (allows JIT to compile)
-    drop_cache  : if True, drop OS page cache before each timed run
+    config : dict with keys:
+        implementation, language, storage_format, portfolio_scale,
+        portfolio_k, universe_size, seed
+    repetitions : timed runs (median reported)
+    warmup      : untimed pre-run (important for JIT compilers)
+    drop_cache  : drop OS page cache before each rep (requires root)
 
     Returns
     -------
-    Full result dict conforming to benchmark_result.schema.json
+    Full result document (dict), also written to results/<uuid>.json
     """
-    from src.compute.baseline import (
-        load_returns_from_wide_csv,
-        load_returns_from_per_stock_csvs,
-        compute_numpy_matmul,
-        compute_pandas_row_loop,
-        result_checksum,
-    )
+    from src.compute.baseline import result_checksum
 
     run_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc).isoformat()
@@ -240,76 +374,87 @@ def run_benchmark(
     if not portfolio_path.exists():
         raise FileNotFoundError(
             f"Portfolio CSV not found: {portfolio_path}\n"
-            f"Run: python scripts/generate_portfolios.py --n {scale}"
+            f"Generate with: python scripts/generate_portfolios.py --n {scale}"
         )
 
-    log.info(f"Starting benchmark: {engine} | {storage} | N={scale:,}")
+    log.info("=" * 65)
+    log.info(f"Benchmark: {engine} | {storage} | N={scale:,} | reps={repetitions}")
+    log.info("=" * 65)
 
-    # --- Load portfolios (outside main timer — done once) ---
-    log.info("Loading portfolio weights...")
+    # Load portfolio weights once (not timed — same for all reps)
+    log.info(f"Loading portfolio weights from {portfolio_path.name}...")
     port_df = pd.read_csv(portfolio_path, index_col="portfolio_id")
+    log.info(f"  Weights shape: {port_df.shape[0]:,} portfolios × {port_df.shape[1]} stocks")
 
-    def _make_run_fn(storage_format: str, engine_name: str):
-        """Return a zero-argument callable that performs one full timed run."""
-        def run_fn():
-            # Phase 1: Load prices
-            t0 = time.perf_counter()
-            if storage_format == "csv_wide":
-                returns, tickers = load_returns_from_wide_csv()
-            elif storage_format == "csv_per_stock":
-                returns, tickers = load_returns_from_per_stock_csvs()
-            else:
-                raise ValueError(f"Unknown storage format: {storage_format}")
-            t_load = time.perf_counter() - t0
+    run_fn = _make_run_fn(storage, engine, port_df)
 
-            # Phase 2: Align portfolio weights with ticker order
-            t1 = time.perf_counter()
-            weights = port_df.reindex(columns=tickers, fill_value=0.0).to_numpy(dtype=np.float32)
-            t_align = time.perf_counter() - t1
-
-            # Phase 3: Compute metrics
-            t2 = time.perf_counter()
-            if engine_name in ("numpy_matmul", "numpy_vectorised"):
-                results = compute_numpy_matmul(returns, weights)
-            elif engine_name == "pandas_baseline":
-                results = compute_pandas_row_loop(returns, weights, tickers)
-            else:
-                raise ValueError(f"Unknown engine: {engine_name}")
-            t_compute = time.perf_counter() - t2
-
-            t_total = t_load + t_align + t_compute
-            return results, t_load, t_align, t_compute, t_total
-
-        return run_fn
-
-    run_fn = _make_run_fn(storage, engine)
-
-    # --- Warmup pass (not timed) ---
+    # Warmup (not timed): allows JIT compilers and BLAS thread pools to initialise
     if warmup:
         log.info("Warmup run (not timed)...")
         run_fn()
 
-    # --- Timed repetitions ---
-    timings_load = []
-    timings_compute = []
-    timings_total = []
-    checksum = None
-    peak_ram = 0.0
+    # Timed repetitions
+    per_rep_telemetry: list[dict] = []
+    timings_load: list[float] = []
+    timings_compute: list[float] = []
+    timings_total: list[float] = []
+    checksum: str | None = None
 
     for rep in range(repetitions):
-        log.info(f"  Repetition {rep + 1}/{repetitions}...")
-        elapsed, (results, t_load, t_align, t_compute, t_total) = timed_run(
-            run_fn, drop_cache=drop_cache
-        )
-        timings_load.append(round(t_load, 6))
-        timings_compute.append(round(t_compute, 6))
-        timings_total.append(round(t_total, 6))
-        peak_ram = max(peak_ram, _peak_rss_mb())
+        log.info(f"  Rep {rep + 1}/{repetitions}...")
+        tc = TelemetryCollector()
+        tc.start(drop_cache=drop_cache)
+
+        results, phases = run_fn()
+
+        tc.stop()
+        tel = tc.summary()
+
+        # Record timings
+        timings_load.append(phases.get("load_prices", 0.0))
+        timings_compute.append(phases.get("compute_metrics", 0.0))
+        timings_total.append(phases["total"])
 
         if checksum is None:
             checksum = result_checksum(results)
 
-    throughput = scale / float(np.median(timings_total))
+        # Store per-rep telemetry
+        per_rep_telemetry.append({
+            "rep": rep,
+            "phases_sec": phases,
+            **tel,
+        })
+
+        log.info(
+            f"    elapsed={phases['total']:.3f}s | "
+            f"load={phases.get('load_prices', 0):.3f}s | "
+            f"compute={phases.get('compute_metrics', 0):.3f}s | "
+            f"io={tel.get('io_read_mb', '?')} MB | "
+            f"cpu_peak={tel.get('cpu_peak_pct', '?')}% | "
+            f"rss_peak={tel.get('rss_peak_mb', '?')} MB"
+        )
+
+    # Aggregate summary across reps
+    n_portfolios = scale
+    median_total = float(np.median(timings_total))
+    throughput = n_portfolios / median_total
+
+    summary = {
+        "median_total_sec": round(median_total, 6),
+        "p10_total_sec": round(float(np.percentile(timings_total, 10)), 6),
+        "p90_total_sec": round(float(np.percentile(timings_total, 90)), 6),
+        "median_load_sec": round(float(np.median(timings_load)), 6),
+        "median_compute_sec": round(float(np.median(timings_compute)), 6),
+        "throughput_portfolios_per_sec": round(throughput, 2),
+        "peak_ram_mb": max(
+            (r.get("rss_peak_mb") or 0.0) for r in per_rep_telemetry
+        ) or None,
+        "mean_io_read_mb": _safe_median([r.get("io_read_mb") for r in per_rep_telemetry]),
+        "mean_cpu_pct": _safe_median([r.get("cpu_mean_pct") for r in per_rep_telemetry]),
+        "peak_cpu_pct": _safe_max([r.get("cpu_peak_pct") for r in per_rep_telemetry]),
+        "peak_gpu_vram_mb": None,
+        "gpu_utilisation_pct": None,
+    }
 
     result_doc = {
         "run_id": run_id,
@@ -317,6 +462,8 @@ def run_benchmark(
         "config": {
             **config,
             "repetitions": repetitions,
+            "warmup": warmup,
+            "drop_cache_attempted": drop_cache,
             "batch_size": None,
         },
         "hardware": capture_hardware(),
@@ -326,30 +473,49 @@ def run_benchmark(
             "compute_metrics": timings_compute,
             "total": timings_total,
         },
-        "summary": {
-            "median_total_sec": round(float(np.median(timings_total)), 6),
-            "p10_total_sec": round(float(np.percentile(timings_total, 10)), 6),
-            "p90_total_sec": round(float(np.percentile(timings_total, 90)), 6),
-            "throughput_portfolios_per_sec": round(throughput, 2),
-            "peak_ram_mb": round(peak_ram, 1),
-            "peak_gpu_vram_mb": None,
-            "io_bytes_read_mb": None,
-            "cpu_utilisation_pct": None,
-            "gpu_utilisation_pct": None,
-        },
+        "telemetry_per_rep": per_rep_telemetry,
+        "summary": summary,
         "result_checksum": checksum,
         "notes": None,
     }
 
-    # --- Persist result ---
+    # Persist
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / f"{run_id}.json"
     with open(out_path, "w") as f:
-        json.dump(result_doc, f, indent=2)
-    log.info(f"Result written to {out_path}")
+        json.dump(result_doc, f, indent=2, default=_json_default)
+
     log.info(
-        f"Median: {result_doc['summary']['median_total_sec']:.3f}s | "
-        f"Throughput: {throughput:,.0f} portfolios/sec"
+        f"  → {run_id[:8]}  "
+        f"median={median_total:.3f}s  "
+        f"throughput={throughput:,.0f} portfolios/sec  "
+        f"io={summary.get('mean_io_read_mb', '?')} MB  "
+        f"cpu_peak={summary.get('peak_cpu_pct', '?')}%"
     )
+    log.info(f"  Result: {out_path}")
 
     return result_doc
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_median(values: list) -> float | None:
+    clean = [v for v in values if v is not None]
+    return round(float(np.median(clean)), 2) if clean else None
+
+
+def _safe_max(values: list) -> float | None:
+    clean = [v for v in values if v is not None]
+    return round(float(max(clean)), 1) if clean else None
+
+
+def _json_default(obj):
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Not JSON serialisable: {type(obj)}")

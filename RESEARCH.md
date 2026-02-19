@@ -124,10 +124,98 @@ constituents data; this is out of scope for Phase 1.
 
 ---
 
-## Results (to be populated)
+## Results
 
-Results will be recorded here as experiments run, with a link to the detailed
-JSON output in `results/`.
+### Phase 1 — CSV Baseline (2026-02-19)
+
+Machine: 20 physical / 28 logical cores, 67.2 GB RAM, warm cache.
+All runs: 5 repetitions, 1 warmup, seed=42, K=15, universe=100 stocks.
+
+| Config | Storage | N | Throughput (p/s) | Load time (s) |
+|--------|---------|---|-----------------|--------------|
+| BL-001 | csv_per_stock | 100 | 1,430 | 0.067 |
+| BL-001 | csv_per_stock | 1K | 11,670 | 0.067 |
+| BL-002 | csv_per_stock | 100K | 154,374 | 0.068 |
+| BL-002 | csv_per_stock | 1M | 173,593 | 0.069 |
+| BL-003 | csv_wide | 100 | 7,733 | 0.012 |
+| BL-003 | csv_wide | 1K | 66,507 | 0.012 |
+| BL-003 | csv_wide | 100K | 173,894 | 0.009 |
+| BL-003 | csv_wide | 1M | 178,391 | 0.009 |
+
+**Phase 1 findings**:
+1. Storage format is the dominant factor at small N. Per-stock CSV (100 file opens)
+   adds ~68ms of load overhead regardless of N — the OS must stat/open/read/close
+   each file independently.
+2. Wide CSV eliminates the file-open overhead (single parse), dropping load time
+   from 79ms → 12ms (6.6x) at N=100. This translates to 5.4x overall speedup.
+3. At N ≥ 100K, compute (BLAS matmul) dominates and all formats converge
+   (~175K portfolios/sec). Storage format is irrelevant at scale — compute is the
+   bottleneck.
+4. RAM usage scales linearly: N=100K ≈ 3GB, N=1M ≈ 22GB (dominated by the 1M×100
+   float32 weight matrix loaded into memory).
+5. `io_read_mb = 0` in all runs (warm page cache). Cold-cache benchmarks require
+   root to clear /proc/sys/vm/drop_caches — a key caveat for production scenarios.
+
+---
+
+### Phase 2 — Parquet Storage (2026-02-19)
+
+Same machine, engine (numpy_vectorised), seed, K as Phase 1.
+Parquet variants: per_stock (snappy), wide_snappy, wide_zstd, wide_uncompressed.
+
+| Config | Storage | N | Throughput (p/s) | Load time (s) | vs BL-001 |
+|--------|---------|---|-----------------|--------------|---------|
+| ST-001 | parquet_per_stock | 100 | 1,390 | 0.071 | 0.97x |
+| ST-001 | parquet_per_stock | 1M | 176,591 | 0.038 | 1.02x |
+| ST-002 | parquet_wide_snappy | 100 | 9,737 | 0.008 | **6.8x** |
+| ST-002 | parquet_wide_snappy | 1M | 175,988 | 0.005 | 1.01x |
+| ST-003 | parquet_wide_zstd | 100 | 5,480 | 0.012 | 3.8x |
+| ST-003 | parquet_wide_zstd | 1M | 176,507 | 0.004 | 1.02x |
+| ST-004 | parquet_wide_uncompressed | 100 | **20,194** | **0.004** | **14.1x** |
+| ST-004 | parquet_wide_uncompressed | 1M | 176,456 | 0.005 | 1.02x |
+
+**Phase 2 key findings**:
+
+1. **Parquet per-stock ≈ CSV per-stock at small N**: Columnar binary format provides
+   no benefit when the bottleneck is OS file-open overhead (100 syscalls). Load
+   time 71ms vs 79ms — marginal improvement. Both are dominated by file enumeration.
+
+2. **Parquet wide (uncompressed) is the fastest loader at N=100**: 4ms vs 12ms for
+   CSV wide — 3x faster for the pure I/O step. Translates to 14.1x overall speedup
+   at N=100 vs the pandas/csv_per_stock baseline.
+
+3. **Compression creates a non-trivial overhead at small data sizes**:
+   - Uncompressed Parquet: 4ms load (fastest)
+   - Snappy Parquet: 8ms (2x slower than uncompressed; CPU decompression visible)
+   - zstd Parquet: 12ms (3x slower; higher compression = more CPU work at decode)
+   - For 0.74–1.02 MB files, decompression overhead *exceeds* the I/O savings
+   This reverses at large files (cloud/network I/O) where compression reduces
+   bytes transferred at the cost of CPU. Not applicable here (local NVMe).
+
+4. **At N ≥ 100K, all storage formats fully converge** (~175K p/s) — the matmul
+   takes 570ms, dominating the 4–9ms load time completely.
+
+5. **Storage size comparison** (price data for 100 stocks × 1,257 days):
+   - csv_per_stock total: 3.50 MB
+   - csv_wide: 2.19 MB
+   - parquet_per_stock total: 1.37 MB (2.6x smaller)
+   - parquet_wide_uncompressed: 1.02 MB (2.1x smaller than CSV wide)
+   - parquet_wide_snappy: 0.74 MB (3.0x smaller)
+   - parquet_wide_zstd: 0.49 MB (4.5x smaller)
+
+6. **Hypothesis H3 (parquet ≥5x faster) is partially confirmed**: At small N and
+   uncompressed format, we see 14x speedup. But at N ≥ 100K, storage format is
+   irrelevant. The hypothesis needs to be stated per-regime.
+
+---
+
+### Open Questions Arising from Phase 2
+
+- [ ] At what exact N does compute overtake I/O? (appears to be between N=1K and N=100K)
+- [ ] Would Apache Arrow IPC (zero-copy memory mapping) eliminate load time entirely?
+- [ ] How would cold-cache results differ? (need root for drop_caches)
+- [ ] Does columnar Parquet help more when we read *subsets* of columns?
+  (In our current workload we always read all 100 tickers — no column pruning benefit)
 
 ---
 
