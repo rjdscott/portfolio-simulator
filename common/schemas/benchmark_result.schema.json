@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "benchmark_result.schema.json",
+  "title": "BenchmarkResult",
+  "description": "Schema for a single benchmark run result. All implementations must conform to this schema.",
+  "type": "object",
+  "required": ["run_id", "timestamp", "config", "hardware", "software", "timings_sec", "summary"],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID v4 uniquely identifying this run"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp when the run started"
+    },
+    "config": {
+      "type": "object",
+      "required": ["implementation", "language", "storage_format", "portfolio_scale", "portfolio_k", "universe_size", "seed", "repetitions"],
+      "properties": {
+        "implementation": {
+          "type": "string",
+          "enum": [
+            "pandas_baseline",
+            "numpy_vectorised",
+            "numba_parallel",
+            "cupy_gpu",
+            "cpp_openmp",
+            "cpp_blas",
+            "cpp_cuda",
+            "rust_rayon",
+            "rust_ndarray",
+            "kotlin_jvm",
+            "kotlin_coroutines",
+            "spark_local",
+            "dask_local",
+            "ray_local"
+          ],
+          "description": "Compute implementation identifier"
+        },
+        "language": {
+          "type": "string",
+          "enum": ["python", "cpp", "rust", "kotlin", "java", "spark", "dask", "ray"],
+          "description": "Primary implementation language"
+        },
+        "storage_format": {
+          "type": "string",
+          "enum": [
+            "csv_per_stock",
+            "csv_long",
+            "csv_wide",
+            "parquet_per_stock",
+            "parquet_wide",
+            "arrow_ipc",
+            "hdf5",
+            "zarr"
+          ],
+          "description": "Storage format used for price data"
+        },
+        "portfolio_scale": {
+          "type": "integer",
+          "enum": [100, 1000, 100000, 1000000, 100000000, 1000000000],
+          "description": "Number of portfolios benchmarked"
+        },
+        "portfolio_k": {
+          "type": "integer",
+          "description": "Number of stocks per portfolio (K)"
+        },
+        "universe_size": {
+          "type": "integer",
+          "description": "Number of stocks in the benchmark universe"
+        },
+        "seed": {
+          "type": "integer",
+          "description": "Global random seed used for portfolio generation"
+        },
+        "repetitions": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of timed repetitions"
+        },
+        "batch_size": {
+          "type": ["integer", "null"],
+          "description": "Batch size for large-scale seeded generation (null if fully materialised)"
+        }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "required": ["cpu_model", "cpu_logical_cores", "ram_gb"],
+      "properties": {
+        "cpu_model": {"type": "string"},
+        "cpu_logical_cores": {"type": "integer"},
+        "cpu_physical_cores": {"type": ["integer", "null"]},
+        "ram_gb": {"type": "number"},
+        "gpu_model": {"type": ["string", "null"]},
+        "gpu_vram_gb": {"type": ["number", "null"]},
+        "storage_type": {"type": "string", "enum": ["nvme", "ssd", "hdd", "tmpfs", "ram"]}
+      }
+    },
+    "software": {
+      "type": "object",
+      "required": ["os", "implementation_version"],
+      "properties": {
+        "os": {"type": "string"},
+        "kernel_version": {"type": ["string", "null"]},
+        "python_version": {"type": ["string", "null"]},
+        "numpy_version": {"type": ["string", "null"]},
+        "pandas_version": {"type": ["string", "null"]},
+        "numba_version": {"type": ["string", "null"]},
+        "cupy_version": {"type": ["string", "null"]},
+        "rust_version": {"type": ["string", "null"]},
+        "kotlin_version": {"type": ["string", "null"]},
+        "jvm_version": {"type": ["string", "null"]},
+        "cpp_compiler": {"type": ["string", "null"]},
+        "blas_implementation": {"type": ["string", "null"]},
+        "implementation_version": {
+          "type": "string",
+          "description": "Git commit SHA of the implementation"
+        }
+      }
+    },
+    "timings_sec": {
+      "type": "object",
+      "description": "Per-repetition timings in seconds for each phase",
+      "required": ["total"],
+      "properties": {
+        "load_prices": {
+          "type": "array",
+          "items": {"type": "number"},
+          "description": "Time to read price data from disk"
+        },
+        "compute_returns_matrix": {
+          "type": "array",
+          "items": {"type": "number"},
+          "description": "Time to compute log-returns matrix from prices"
+        },
+        "load_portfolios": {
+          "type": "array",
+          "items": {"type": "number"},
+          "description": "Time to load or generate portfolio weight matrix"
+        },
+        "compute_metrics": {
+          "type": "array",
+          "items": {"type": "number"},
+          "description": "Time to compute cumulative return and Sharpe ratio for all portfolios"
+        },
+        "total": {
+          "type": "array",
+          "items": {"type": "number"},
+          "description": "End-to-end wall-clock time (all phases)"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["median_total_sec", "p10_total_sec", "p90_total_sec", "throughput_portfolios_per_sec"],
+      "properties": {
+        "median_total_sec": {"type": "number"},
+        "p10_total_sec": {"type": "number"},
+        "p90_total_sec": {"type": "number"},
+        "throughput_portfolios_per_sec": {"type": "number"},
+        "peak_ram_mb": {"type": ["number", "null"]},
+        "peak_gpu_vram_mb": {"type": ["number", "null"]},
+        "io_bytes_read_mb": {"type": ["number", "null"]},
+        "cpu_utilisation_pct": {"type": ["number", "null"]},
+        "gpu_utilisation_pct": {"type": ["number", "null"]}
+      }
+    },
+    "result_checksum": {
+      "type": ["string", "null"],
+      "description": "SHA-256 of the sorted output array (cumulative_return, sharpe) to verify all implementations agree"
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "description": "Free-text notes about this run"
+    }
+  }
+}

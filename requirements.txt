@@ -1,0 +1,18 @@
+# Core dependencies — install these first
+# pip install -r requirements.txt
+
+# Data acquisition
+yfinance>=0.2.40
+pandas>=2.2.0
+pandas-datareader>=0.10.0
+lxml>=5.0.0
+html5lib>=1.1
+
+# Numeric compute
+numpy>=1.26.0
+
+# Progress and CLI
+tqdm>=4.66.0
+
+# System introspection
+psutil>=5.9.0
