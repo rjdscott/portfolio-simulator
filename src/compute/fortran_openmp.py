@@ -67,17 +67,19 @@ def _load_lib() -> ctypes.CDLL:
 
     lib = ctypes.CDLL(str(so_path))
 
-    # subroutine compute_portfolio_metrics(r_ptr, w_ptr, out_ptr, N, T, U) BIND(C)
-    #   type(C_PTR),        value :: r_ptr, w_ptr, out_ptr
-    #   integer(C_INT64_T), value :: N, T, U
+    # subroutine compute_portfolio_metrics(N, T, U, r, w, out) BIND(C)
+    #   integer(C_INT64_T), value          :: N, T, U
+    #   real(C_DOUBLE),     intent(in)  :: r(U, T), w(U, N)
+    #   real(C_DOUBLE),     intent(out) :: out(2, N)
+    # N, T, U precede the arrays so the Fortran compiler sees dimensions first.
     lib.compute_portfolio_metrics.restype = None
     lib.compute_portfolio_metrics.argtypes = [
-        ctypes.c_void_p,  # r_ptr
-        ctypes.c_void_p,  # w_ptr
-        ctypes.c_void_p,  # out_ptr
         ctypes.c_int64,   # N
         ctypes.c_int64,   # T
         ctypes.c_int64,   # U
+        ctypes.c_void_p,  # r  — numpy (T, U) C-order viewed as Fortran (U, T)
+        ctypes.c_void_p,  # w  — numpy (N, U) C-order viewed as Fortran (U, N)
+        ctypes.c_void_p,  # out
     ]
 
     _lib = lib
@@ -111,12 +113,12 @@ def compute_fortran_openmp(
     results = np.empty((N, 2), dtype=np.float64)
 
     lib.compute_portfolio_metrics(
-        R.ctypes.data_as(ctypes.c_void_p),
-        W.ctypes.data_as(ctypes.c_void_p),
-        results.ctypes.data_as(ctypes.c_void_p),
         ctypes.c_int64(N),
         ctypes.c_int64(T),
         ctypes.c_int64(U),
+        R.ctypes.data_as(ctypes.c_void_p),
+        W.ctypes.data_as(ctypes.c_void_p),
+        results.ctypes.data_as(ctypes.c_void_p),
     )
 
     return results

@@ -296,30 +296,30 @@ K = 15 stocks per portfolio, 100-stock universe (top S&P 500 by market cap, 2020
 ## 10. Phase 3b — Extended Engine Survey
 
 > 7 additional languages / runtimes. Storage fixed at `parquet_wide_uncompressed`.
-> Warm cache, 5 repetitions. `fortran_openmp` requires `gfortran` (results pending).
+> Warm cache, 5 repetitions.
 
 ### Throughput (portfolios/second)
 
 | Engine              |    N=100 |      N=1K |    N=100K |       N=1M | vs NumPy (1M) |
 | :------------------ | -------: | --------: | --------: | ---------: | ------------: |
+| fortran_openmp      | 20,517/s | 160,694/s | 779,029/s | 828,035/s  |     **4.7×**  |
 | julia_loopvec       | 23,250/s | 199,681/s | 707,409/s | 745,475/s  |     **4.2×**  |
 | rust_rayon_nightly  | 10,045/s |  79,994/s | 655,304/s | 654,643/s  |     **3.7×**  |
 | java_vector_api     | 19,585/s | 117,481/s | 460,764/s | 476,253/s  |     **2.7×**  |
 | go_goroutines       | 20,773/s | 118,287/s | 323,932/s | 344,630/s  |     **1.9×**  |
 | polars_engine       |  1,943/s |  22,219/s | 105,927/s |  83,811/s  |       0.47×   |
 | duckdb_sql          |    884/s |   1,119/s |  11,360/s |       N/A* |           —   |
-| fortran_openmp      |      —   |        —  |        —  |         —  |    pending†   |
 
 *DuckDB N=1M: data-melt step creates 100M-row DataFrame (prohibitively slow; a
 fully-native DuckDB pipeline reading from Parquet directly would avoid this).
-†Requires `sudo apt-get install gfortran` then `cmake --build implementations/fortran/openmp/build`.
 
 ### Performance at N=1M
 
 ```
   numba_parallel       919,968/s  ████████████████████████████  (Phase 3 champion)
+  fortran_openmp       828,035/s  █████████████████████████░░░  explicit-shape BIND(C) → AVX2
   cpp_openmp           826,211/s  █████████████████████████░░░  (Phase 3)
-  julia_loopvec        745,475/s  ██████████████████████░░░░░░  ← Phase 3b best
+  julia_loopvec        745,475/s  ██████████████████████░░░░░░  ← Phase 3b best (scripted)
   rust_rayon_nightly   654,643/s  ████████████████████░░░░░░░░  fadd_fast +41% vs stable
   java_vector_api      476,253/s  ██████████████░░░░░░░░░░░░░░  Vector API + ForkJoinPool
   rust_rayon           465,250/s  ██████████████░░░░░░░░░░░░░░  (Phase 3, stable)
@@ -331,6 +331,7 @@ fully-native DuckDB pipeline reading from Parquet directly would avoid this).
 
 ### Phase 3b Key Findings
 
+- **FORTRAN ties C++ OpenMP** (828K vs 826K at 1M, 0.2% difference). gfortran with `-ffast-math -march=native -fopenmp` and `!$OMP SIMD REDUCTION SIMDLEN(4)` produces identical AVX2 code. Critical: requires explicit-shape dummy args `r(U, T)` with `BIND(C)` — `C_F_POINTER` deferred-shape arrays prevent gfortran from proving stride-1 and fall back to scalar SSE2.
 - **Julia matches C++ OpenMP** (745K vs 826K at 1M). `@turbo` + `Threads.@threads` over 28 cores achieves near-native SIMD without explicit C intrinsics. Julia wins at N=1K (199K vs 190K).
 - **Rust nightly `fadd_fast` closes the gap to Rust stable**: 654K vs 465K (+41%). Still 25% below Numba — `fadd_fast` is weaker than C++'s `-ffast-math` at the loop level.
 - **Java Vector API is competitive**: 476K (2.7×) — HotSpot C2 JIT compiles `DoubleVector.SPECIES_256` to AVX2 after warmup. Comparable to Rust stable at large N.
@@ -348,7 +349,7 @@ fully-native DuckDB pipeline reading from Parquet directly would avoid this).
 | go_goroutines | ctypes → .so | `//export` + `unsafe.Slice`; goroutine pool via `sync.WaitGroup` |
 | polars_engine | pure Python | `pl.sum_horizontal` + NumPy matmul |
 | duckdb_sql | pure Python | long-form DataFrames; SQL GROUP BY |
-| fortran_openmp | ctypes → .so | `BIND(C)` + `ISO_C_BINDING`; `!$OMP SIMD` |
+| fortran_openmp | ctypes → .so | explicit-shape BIND(C) dummy args; `!$OMP SIMD REDUCTION SIMDLEN(4)`; gfortran AVX2 |
 
 ---
 
@@ -360,7 +361,9 @@ fully-native DuckDB pipeline reading from Parquet directly would avoid this).
 | Engine             | N=1M throughput | N=100M est. time | N=1B est. time | Notes |
 | :----------------- | --------------: | ---------------: | -------------: | :---- |
 | numba_parallel     |       920K/s    |         1.8 min  |       18 min   | Best single-machine, Phase 3 |
-| julia_loopvec      |       745K/s    |         2.2 min  |       22 min   | Best Phase 3b |
+| fortran_openmp     |       828K/s    |         2.0 min  |       20 min   | Tied with C++ OpenMP; AVX2 via gfortran |
+| cpp_openmp         |       826K/s    |         2.0 min  |       20 min   | Phase 3 |
+| julia_loopvec      |       745K/s    |         2.2 min  |       22 min   | Best Phase 3b (scripted lang) |
 | numpy_vectorised   |       178K/s    |         9.4 min  |       94 min   | Baseline |
 | spark_local        |    pending Ph4  |             —    |          —     | Seeded batch |
 | dask_local         |    pending Ph4  |             —    |          —     | Seeded batch |
@@ -434,6 +437,7 @@ seeded batch generation.
 | H-JL1 | Julia LoopVectorization ≈ Numba | ✅ Confirmed | 745K vs 920K at 1M (81%); wins at N=1K (200K vs 193K) |
 | H-GO1 | Go goroutines ~200–400K/s | ✅ Confirmed | 324K (100K) and 345K (1M) — at upper bound; no SIMD in gc compiler |
 | H-JV1 | Java Vector API ~400–700K/s | ✅ Confirmed | 461K (100K) and 476K (1M) — HotSpot JIT compiles AVX2 after warmup |
+| H-F1  | FORTRAN within ±5% of C++ OpenMP | ✅ Confirmed | 828K vs 826K at N=1M (0.2%); AVX2 requires explicit-shape `BIND(C)` dummy args, not `C_F_POINTER` |
 
 ## 14. Open Questions
 
