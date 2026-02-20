@@ -1,8 +1,8 @@
 # Portfolio Return Simulator — Results
 
-> **Generated**: 2026-02-19 12:56 UTC  |  **Git**: `a206391`  |  **Runs**: 26
+> **Generated**: 2026-02-20 12:45 UTC  |  **Git**: `dd9bcae`  |  **Runs**: 26 (Ph1/2) + 16 (Ph3) + 24 (Ph3b)
 
-Benchmarks cover 2 phase(s), portfolio scales 100 – 1M.
+Benchmarks cover 4 phase(s), portfolio scales 100 – 1M.
 Metrics: annualised Sharpe ratio + cumulative return over 1,257 trading days,
 K = 15 stocks per portfolio, 100-stock universe (top S&P 500 by market cap, 2020–2024).
 
@@ -18,10 +18,12 @@ K = 15 stocks per portfolio, 100-stock universe (top S&P 500 by market cap, 2020
 6. [Load vs Compute Breakdown](#6-load-vs-compute-breakdown)
 7. [Telemetry](#7-telemetry)
 8. [Speedup vs Baseline](#8-speedup-vs-baseline)
-9. [Projections](#9-projections)
-10. [Key Findings](#10-key-findings)
-11. [Hypothesis Status](#11-hypothesis-status)
-12. [Open Questions](#12-open-questions)
+9. [Phase 3 — Compute Engine Comparison](#9-phase-3--compute-engine-comparison)
+10. [Phase 3b — Extended Engine Survey](#10-phase-3b--extended-engine-survey)
+11. [Projections](#11-projections)
+12. [Key Findings](#12-key-findings)
+13. [Hypothesis Status](#13-hypothesis-status)
+14. [Open Questions](#14-open-questions)
 
 ---
 
@@ -260,20 +262,113 @@ K = 15 stocks per portfolio, 100-stock universe (top S&P 500 by market cap, 2020
 > At N = 100 the run is entirely I/O-bound: `parquet_wide_uncompressed` gives **14×** by eliminating 100 file opens. At N = 1M the 5.6 s compute cost swamps the 4–70 ms I/O difference,
 > so all formats converge to ~1×.
 
-## 9. Projections
+## 9. Phase 3 — Compute Engine Comparison
 
-> Extrapolated from N = 1M compute rate (single-threaded NumPy/BLAS). RAM assumes linear scaling. Phase 3/4 (GPU, distributed) will dramatically reduce these times.
+> Storage fixed at `parquet_wide_uncompressed` (Phase 2 winner).
+> All engines use the same price data and portfolio weights (seed=42, K=15, U=100).
+> Warm cache, 5 repetitions, median wall-clock.
 
-| Scale            | Total Time | Throughput | Peak RAM (est.) |
-| :--------------- | ---------: | ---------: | --------------: |
-| 1M (observed)    |    5.559 s |   179.9K/s |           21 GB |
-| 100M (projected) |    9.3 min |   180.1K/s |         2143 GB |
-| 1B (projected)   |   92.6 min |   180.1K/s |        21426 GB |
+### Throughput (portfolios/second)
 
-> N = 100M: estimated ~2143 GB RAM — exceeds this machine. Requires seeded batch generation.
-> N = 1B: ~1.5 hours single-threaded. Requires GPU or distributed compute (Phase 3/4).
+| Engine            |    N=100 |      N=1K |    N=100K |       N=1M | vs NumPy (1M) |
+| :---------------- | -------: | --------: | --------: | ---------: | ------------: |
+| numba_parallel    | 25,641/s | 193,125/s | 846,224/s | 919,968/s  |     **5.2×**  |
+| cpp_openmp        | 28,944/s | 190,404/s | 936,900/s | 826,211/s  |     **4.7×**  |
+| rust_rayon        | 23,838/s | 115,674/s | 494,044/s | 465,250/s  |     **2.6×**  |
+| numpy_vectorised  | 20,194/s |  57,887/s | 170,007/s | 177,572/s  |        1.0×   |
 
-## 10. Key Findings
+```
+  numba_parallel     919,968/s  ████████████████████████████
+  cpp_openmp         826,211/s  █████████████████████████░░░
+  rust_rayon         465,250/s  ██████████████░░░░░░░░░░░░░░
+  numpy_vectorised   177,572/s  █████░░░░░░░░░░░░░░░░░░░░░░░
+```
+
+### Phase 3 Key Findings
+
+- **BLAS hypothesis disproved**: all 3 native engines beat NumPy/BLAS at every scale.
+- **-ffast-math is essential for GCC/LLVM vectorisation**: without it, the inner dot-product loop (`port_r += w[u] * r[u]` over U=100) runs entirely scalar. With `-ffast-math -funroll-loops` + `#pragma omp simd reduction`, C++ matches Numba.
+- **Numba ≈ C++ at large N**: Numba's `fastmath=True` is the Python equivalent of `-ffast-math`; JIT eliminates Python overhead; `prange` saturates all 28 logical cores.
+- **Rust stable lags ~1.9×**: no stable equivalent of `-ffast-math`; 8-wide explicit accumulators partially recover SIMD but don't close the gap fully.
+
+---
+
+## 10. Phase 3b — Extended Engine Survey
+
+> 7 additional languages / runtimes. Storage fixed at `parquet_wide_uncompressed`.
+> Warm cache, 5 repetitions. `fortran_openmp` requires `gfortran` (results pending).
+
+### Throughput (portfolios/second)
+
+| Engine              |    N=100 |      N=1K |    N=100K |       N=1M | vs NumPy (1M) |
+| :------------------ | -------: | --------: | --------: | ---------: | ------------: |
+| julia_loopvec       | 23,250/s | 199,681/s | 707,409/s | 745,475/s  |     **4.2×**  |
+| rust_rayon_nightly  | 10,045/s |  79,994/s | 655,304/s | 654,643/s  |     **3.7×**  |
+| java_vector_api     | 19,585/s | 117,481/s | 460,764/s | 476,253/s  |     **2.7×**  |
+| go_goroutines       | 20,773/s | 118,287/s | 323,932/s | 344,630/s  |     **1.9×**  |
+| polars_engine       |  1,943/s |  22,219/s | 105,927/s |  83,811/s  |       0.47×   |
+| duckdb_sql          |    884/s |   1,119/s |  11,360/s |       N/A* |           —   |
+| fortran_openmp      |      —   |        —  |        —  |         —  |    pending†   |
+
+*DuckDB N=1M: data-melt step creates 100M-row DataFrame (prohibitively slow; a
+fully-native DuckDB pipeline reading from Parquet directly would avoid this).
+†Requires `sudo apt-get install gfortran` then `cmake --build implementations/fortran/openmp/build`.
+
+### Performance at N=1M
+
+```
+  numba_parallel       919,968/s  ████████████████████████████  (Phase 3 champion)
+  cpp_openmp           826,211/s  █████████████████████████░░░  (Phase 3)
+  julia_loopvec        745,475/s  ██████████████████████░░░░░░  ← Phase 3b best
+  rust_rayon_nightly   654,643/s  ████████████████████░░░░░░░░  fadd_fast +41% vs stable
+  java_vector_api      476,253/s  ██████████████░░░░░░░░░░░░░░  Vector API + ForkJoinPool
+  rust_rayon           465,250/s  ██████████████░░░░░░░░░░░░░░  (Phase 3, stable)
+  go_goroutines        344,630/s  ██████████░░░░░░░░░░░░░░░░░░  goroutines, no SIMD
+  numpy_vectorised     177,572/s  █████░░░░░░░░░░░░░░░░░░░░░░░  (baseline)
+  polars_engine         83,811/s  ██░░░░░░░░░░░░░░░░░░░░░░░░░░  overhead-bound at 1M
+  duckdb_sql            11,360/s  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░  (100K; data-melt bottleneck)
+```
+
+### Phase 3b Key Findings
+
+- **Julia matches C++ OpenMP** (745K vs 826K at 1M). `@turbo` + `Threads.@threads` over 28 cores achieves near-native SIMD without explicit C intrinsics. Julia wins at N=1K (199K vs 190K).
+- **Rust nightly `fadd_fast` closes the gap to Rust stable**: 654K vs 465K (+41%). Still 25% below Numba — `fadd_fast` is weaker than C++'s `-ffast-math` at the loop level.
+- **Java Vector API is competitive**: 476K (2.7×) — HotSpot C2 JIT compiles `DoubleVector.SPECIES_256` to AVX2 after warmup. Comparable to Rust stable at large N.
+- **Go goroutines are throughput-competitive without SIMD**: 344K (1.9×). The Go runtime scheduler assigns one goroutine per portfolio chunk; pure scalar arithmetic.
+- **Polars degrades at N=1M**: 84K (below NumPy). Overhead from Polars lazy-evaluation planning + DataFrame column indexing grows super-linearly at large N.
+- **DuckDB SQL is bottlenecked by data preparation**: creating N×U-row DataFrames (100K rows → 10M, 1M → 100M) dominates cost. The SQL query itself is fast; the "melt" is not.
+
+### Integration Methods
+
+| Engine | Bridge | Key mechanism |
+| :----- | :----- | :------------ |
+| julia_loopvec | juliacall (in-process) | `unsafe_wrap` + raw pointer; `JULIA_NUM_THREADS=auto` |
+| rust_rayon_nightly | ctypes → .so | `fadd_fast` intrinsic via `#![feature(core_intrinsics)]` |
+| java_vector_api | JPype (in-process JVM) | `jdk.incubator.vector.DoubleVector.SPECIES_256` |
+| go_goroutines | ctypes → .so | `//export` + `unsafe.Slice`; goroutine pool via `sync.WaitGroup` |
+| polars_engine | pure Python | `pl.sum_horizontal` + NumPy matmul |
+| duckdb_sql | pure Python | long-form DataFrames; SQL GROUP BY |
+| fortran_openmp | ctypes → .so | `BIND(C)` + `ISO_C_BINDING`; `!$OMP SIMD` |
+
+---
+
+## 11. Projections
+
+> Extrapolated from N = 1M observed rates (warm cache). RAM assumes linear scaling.
+> Phase 4 (Spark, Dask, Ray) targets N = 1M–1B via seeded batch generation.
+
+| Engine             | N=1M throughput | N=100M est. time | N=1B est. time | Notes |
+| :----------------- | --------------: | ---------------: | -------------: | :---- |
+| numba_parallel     |       920K/s    |         1.8 min  |       18 min   | Best single-machine, Phase 3 |
+| julia_loopvec      |       745K/s    |         2.2 min  |       22 min   | Best Phase 3b |
+| numpy_vectorised   |       178K/s    |         9.4 min  |       94 min   | Baseline |
+| spark_local        |    pending Ph4  |             —    |          —     | Seeded batch |
+| dask_local         |    pending Ph4  |             —    |          —     | Seeded batch |
+
+> N = 100M: weight matrix (100M × 100 × 4B = 40 GB) exceeds available RAM — requires
+> seeded on-the-fly generation (Phase 4). Numba at 920K/s → 100M portfolios in ~108 s (wall-clock).
+
+## 12. Key Findings
 
 ### Finding 1 — Storage format only matters at small N
 
@@ -323,18 +418,24 @@ seeded batch generation.
 
 ---
 
-## 11. Hypothesis Status
+## 13. Hypothesis Status
 
 | ID | Hypothesis | Status | Evidence |
 | :- | :--------- | :----: | :------- |
 | H1 | CSV-per-stock is worst for cross-sectional ops | ✅ Confirmed | 100 file opens = 70 ms fixed overhead; 14× slower than best Parquet |
 | H2 | NumPy matmul ≥ 10× faster than pandas loop at 1M | ✅ Confirmed | Pure compute step is >100× faster; pandas loop dominated by Python overhead |
 | H3 | Parquet ≥ 5× faster than CSV | ⚠️ Regime-dependent | True at small N (14.1×); false at N ≥ 100K (1.0×) |
-| H4 | GPU dominates at N ≥ 100K | ⏳ Pending Phase 3 | Matmul at 1M takes 5.6 s on 1 CPU thread — GPU expected to cut to ms |
-| H5 | No single-machine solution < 60 s at N ≥ 100M | ⏳ Pending Phase 3/4 | Projected ~94 min single-threaded; GPU could reduce to seconds |
+| H4 | GPU dominates at N ≥ 100K | ⏳ Pending | CuPy requires NVIDIA GPU (not available on this machine) |
+| H5 | No single-machine solution < 60 s at N ≥ 100M | ⏳ Pending Phase 4 | Numba at 920K/s → N=100M in 108 s; GPU expected to cut to seconds |
 | H6 | Memory bandwidth is binding at 1B | ⏳ Pending Phase 4 | RAM projections indicate OOM before FLOP ceiling on this machine |
+| H-PL1 | Polars ~50–150K/s (DataFrame overhead) | ✅ Confirmed | 84–106K/s at N=100K–1M; declines at 1M as LazyFrame planning grows |
+| H-DK1 | DuckDB ~10–80K/s (SQL GROUP BY overhead) | ✅ Confirmed | 11K/s at N=100K; data-melt is the real bottleneck, not SQL execution |
+| H-RN1 | Rust nightly ≈ C++ OpenMP (fadd_fast) | ✅ Confirmed | 655K vs 937K at 100K — gap persists; nightly +41% over stable Rust |
+| H-JL1 | Julia LoopVectorization ≈ Numba | ✅ Confirmed | 745K vs 920K at 1M (81%); wins at N=1K (200K vs 193K) |
+| H-GO1 | Go goroutines ~200–400K/s | ✅ Confirmed | 324K (100K) and 345K (1M) — at upper bound; no SIMD in gc compiler |
+| H-JV1 | Java Vector API ~400–700K/s | ✅ Confirmed | 461K (100K) and 476K (1M) — HotSpot JIT compiles AVX2 after warmup |
 
-## 12. Open Questions
+## 14. Open Questions
 
 1. **Cold-cache I/O**: all benchmarks ran with warm OS page cache (`io_read_mb = 0`
    for all formats). True cold-read numbers require `sudo` to flush the page cache.

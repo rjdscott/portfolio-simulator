@@ -235,3 +235,49 @@ Parquet variants: per_stock (snappy), wide_snappy, wide_zstd, wide_uncompressed.
 - RAPIDS cuDF documentation — GPU DataFrame operations
 - Apache Spark MLlib — distributed linear algebra
 - Pedregosa et al. (2011) — benchmark methodology best practices
+
+---
+
+### Phase 3b — Extended Compute Engine Comparison (2026-02-20)
+
+Extends Phase 3 with seven additional languages and runtimes, all on
+`parquet_wide_uncompressed` storage at scales 100 / 1K / 100K / 1M.
+
+| Config ID | Engine               | Language | Parallelism               | Status   |
+|-----------|----------------------|----------|---------------------------|----------|
+| CP-007    | polars_engine        | Python   | Rayon (via Polars)        | planned  |
+| CP-008    | duckdb_sql           | Python   | DuckDB internal           | planned  |
+| CP-009    | rust_rayon_nightly   | Rust     | Rayon + fadd_fast         | planned  |
+| CP-010    | fortran_openmp       | FORTRAN  | OpenMP + -ffast-math      | planned  |
+| CP-011    | julia_loopvec        | Julia    | Threads.@threads + @turbo | planned  |
+| CP-012    | go_goroutines        | Go       | Goroutine worker pool     | planned  |
+| CP-013    | java_vector_api      | Java     | ForkJoinPool + Vector API | planned  |
+
+**Phase 3b Hypotheses**
+
+| ID    | Hypothesis | Rationale |
+|-------|-----------|-----------|
+| H-PL1 | Polars expression API will score 50K–150K/s — below NumPy | Polars lacks native Welford; must fall back to Python-level aggregation |
+| H-DK1 | DuckDB SQL will score 10K–80K/s — lowest compute engine | Join + aggregation path; no SIMD path for dense FP reduction |
+| H-RN1 | Rust nightly (fadd_fast) will reach ~800K–950K/s, matching C++ | Removes the only constraint that prevented LLVM from emitting vfmadd231pd |
+| H-F1  | FORTRAN OpenMP will score within ±5% of C++/OpenMP | Same GCC backend + -ffast-math; difference reflects ctypes overhead only |
+| H-JL1 | Julia @turbo + Threads.@threads will match or exceed Numba | @turbo applies polyhedral SIMD analysis; Julia JIT generates native code via LLVM |
+| H-GO1 | Go goroutines will score 200K–400K/s (1.5–2.5× NumPy) | No SIMD auto-vectorisation for FP reductions; goroutine overhead minimal at this task size |
+| H-JV1 | Java Vector API will score 400K–700K/s (2–4× NumPy) | Explicit 256-bit SIMD via DoubleVector; HotSpot C2 JIT compiles hot loop to AVX2 after warmup |
+
+**Memory layout notes (CRITICAL for native engines)**
+
+All returns and weight arrays passed to Phase 3b engines are C-order (row-major) numpy
+float64 arrays. Engines that use column-major layouts (FORTRAN, Julia) must handle the
+transposition explicitly via pointer arithmetic or index swapping — not array copying.
+
+**Integration approach**
+
+- Python engines (polars, duckdb): direct function call, no build step
+- FORTRAN, Go: ctypes to shared library (.so), same pattern as cpp_openmp
+- Rust nightly: ctypes to .so (separate Cargo workspace from stable crate)
+- Julia: juliacall embedded runtime (started once per process, amortised)
+- Java: JPype embedded JVM (started once per process, amortised) + Vector API JAR
+
+Full research notes: docs/benchmarks/phase3b_engines.md
+

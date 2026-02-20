@@ -339,6 +339,28 @@ def _make_run_fn(storage: str, engine: str, port_df: pd.DataFrame):
         elif engine == "cupy_gpu":
             from src.compute.cupy_gpu import compute_cupy_gpu
             results = compute_cupy_gpu(returns, weights)
+        # Phase 3b engines
+        elif engine == "polars_engine":
+            from src.compute.polars_engine import compute_polars_engine
+            results = compute_polars_engine(returns, weights)
+        elif engine == "duckdb_sql":
+            from src.compute.duckdb_sql import compute_duckdb_sql
+            results = compute_duckdb_sql(returns, weights)
+        elif engine == "rust_rayon_nightly":
+            from src.compute.rust_rayon_nightly import compute_rust_rayon_nightly
+            results = compute_rust_rayon_nightly(returns, weights)
+        elif engine == "fortran_openmp":
+            from src.compute.fortran_openmp import compute_fortran_openmp
+            results = compute_fortran_openmp(returns, weights)
+        elif engine == "julia_loopvec":
+            from src.compute.julia_loopvec import compute_julia_loopvec
+            results = compute_julia_loopvec(returns, weights)
+        elif engine == "go_goroutines":
+            from src.compute.go_goroutines import compute_go_goroutines
+            results = compute_go_goroutines(returns, weights)
+        elif engine == "java_vector_api":
+            from src.compute.java_vector_api import compute_java_vector_api
+            results = compute_java_vector_api(returns, weights)
         else:
             raise ValueError(f"Unknown engine: '{engine}'")
         pt.stop("compute_metrics")
@@ -495,6 +517,222 @@ def run_benchmark(
     }
 
     # Persist
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RESULTS_DIR / f"{run_id}.json"
+    with open(out_path, "w") as f:
+        json.dump(result_doc, f, indent=2, default=_json_default)
+
+    log.info(
+        f"  → {run_id[:8]}  "
+        f"median={median_total:.3f}s  "
+        f"throughput={throughput:,.0f} portfolios/sec  "
+        f"io={summary.get('mean_io_read_mb', '?')} MB  "
+        f"cpu_peak={summary.get('peak_cpu_pct', '?')}%"
+    )
+    log.info(f"  Result: {out_path}")
+
+    return result_doc
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Distributed benchmark entry point
+# ---------------------------------------------------------------------------
+
+def run_distributed_benchmark(
+    config: dict,
+    repetitions: int = 3,
+    warmup: bool = True,
+    drop_cache: bool = False,
+) -> dict:
+    """
+    Run a distributed compute benchmark (Phase 4: Spark, Dask, Ray).
+
+    Differences from run_benchmark():
+    - Portfolio weights are generated on-the-fly (seeded, not from CSV).
+    - Price data is always loaded from parquet_wide_uncompressed.
+    - align_weights phase is omitted (workers align internally).
+    - For N > 10M: returns aggregate_stats dict instead of full results array;
+      result_checksum covers first 10,000 portfolios only.
+
+    Parameters
+    ----------
+    config : dict with keys:
+        implementation, language, storage_format, portfolio_scale,
+        portfolio_k, universe_size, seed, portfolio_source, batch_size
+    repetitions : timed runs (median reported)
+    warmup      : untimed pre-run (important for framework startup)
+    drop_cache  : drop OS page cache before each rep
+
+    Returns
+    -------
+    Full result document (dict), also written to results/<uuid>.json
+    """
+    from src.compute.baseline import result_checksum
+    from src.data.storage import load_returns
+    from src.portfolio.generator import generate_batch, load_universe_tickers
+
+    run_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    scale = config["portfolio_scale"]
+    engine = config["implementation"]
+    k = config.get("portfolio_k", 15)
+    seed = config.get("seed", 42)
+    batch_size = config.get("batch_size", 100_000)
+    storage = "parquet_wide_uncompressed"  # always for Phase 4
+
+    log.info("=" * 65)
+    log.info(f"Distributed benchmark: {engine} | N={scale:,} | reps={repetitions}")
+    log.info("=" * 65)
+
+    # Load universe tickers (from metadata)
+    universe = load_universe_tickers()
+    log.info(f"Universe: {len(universe)} tickers")
+
+    # Load price returns once (not timed — same for all reps)
+    log.info("Loading price data from parquet_wide_uncompressed...")
+    returns, tickers = load_returns(storage)
+    log.info(f"  Returns shape: {returns.shape}")
+
+    # Dispatch function for the engine
+    def _dispatch(ret, tick, univ, n, k_, seed_, bs):
+        if engine == "spark_local":
+            from src.compute.spark_local import compute_spark_local
+            return compute_spark_local(ret, tick, univ, n, k_, seed_, bs)
+        elif engine == "dask_local":
+            from src.compute.dask_local import compute_dask_local
+            return compute_dask_local(ret, tick, univ, n, k_, seed_, bs)
+        elif engine == "ray_local":
+            from src.compute.ray_local import compute_ray_local
+            return compute_ray_local(ret, tick, univ, n, k_, seed_, bs)
+        else:
+            raise ValueError(f"Unknown distributed engine: '{engine}'")
+
+    # Warmup: initialise framework and JIT (untimed)
+    if warmup:
+        log.info("Warmup run (not timed)...")
+        # Use a small N for warmup to keep it fast
+        warmup_n = min(scale, 10_000)
+        _dispatch(returns, tickers, universe, warmup_n, k, seed, batch_size)
+
+    # Timed repetitions
+    per_rep_telemetry: list[dict] = []
+    timings_load: list[float] = []
+    timings_compute: list[float] = []
+    timings_total: list[float] = []
+    checksum: str | None = None
+    aggregate_stats: dict | None = None
+    notes: str | None = None
+
+    for rep in range(repetitions):
+        log.info(f"  Rep {rep + 1}/{repetitions}...")
+        tc = TelemetryCollector()
+        tc.start(drop_cache=drop_cache)
+        pt = PhaseTimer()
+
+        # Phase: load prices
+        pt.start("load_prices")
+        _returns, _tickers = load_returns(storage)
+        pt.stop("load_prices")
+
+        # Phase: distributed compute (includes portfolio generation)
+        pt.start("compute_metrics")
+        results = _dispatch(_returns, _tickers, universe, scale, k, seed, batch_size)
+        pt.stop("compute_metrics")
+
+        tc.stop()
+        tel = tc.summary()
+
+        phases = pt.as_dict()
+        phases["total"] = sum(phases.values())
+
+        timings_load.append(phases.get("load_prices", 0.0))
+        timings_compute.append(phases.get("compute_metrics", 0.0))
+        timings_total.append(phases["total"])
+
+        # Checksum and aggregate stats (on first rep only)
+        if checksum is None:
+            if isinstance(results, dict):
+                # N > 10M: aggregate stats only
+                aggregate_stats = results
+                # Checksum sample: generate first 10K portfolios
+                sample_ids, sample_w = generate_batch(0, 10_000, universe, k=k, global_seed=seed)
+                ticker_idx = [universe.index(t) for t in tickers]
+                sample_w_aligned = sample_w[:, ticker_idx].astype(np.float64)
+                sample_pr = sample_w_aligned @ returns.T
+                sample_cum = np.expm1(sample_pr.sum(axis=1))
+                _std_r = sample_pr.std(axis=1, ddof=1)
+                sample_shr = np.where(
+                    _std_r > 0,
+                    sample_pr.mean(axis=1) / _std_r * np.sqrt(252),
+                    0.0,
+                )
+                sample_results = np.column_stack([sample_cum, sample_shr])
+                checksum = result_checksum(sample_results)
+                notes = "checksum_sample_n=10000"
+            else:
+                checksum = result_checksum(results)
+
+        per_rep_telemetry.append({
+            "rep": rep,
+            "phases_sec": phases,
+            **tel,
+        })
+
+        log.info(
+            f"    elapsed={phases['total']:.3f}s | "
+            f"load={phases.get('load_prices', 0):.3f}s | "
+            f"compute={phases.get('compute_metrics', 0):.3f}s | "
+            f"io={tel.get('io_read_mb', '?')} MB | "
+            f"cpu_peak={tel.get('cpu_peak_pct', '?')}% | "
+            f"rss_peak={tel.get('rss_peak_mb', '?')} MB"
+        )
+
+    # Aggregate summary
+    median_total = float(np.median(timings_total))
+    throughput = scale / median_total
+
+    summary = {
+        "median_total_sec": round(median_total, 6),
+        "p10_total_sec": round(float(np.percentile(timings_total, 10)), 6),
+        "p90_total_sec": round(float(np.percentile(timings_total, 90)), 6),
+        "median_load_sec": round(float(np.median(timings_load)), 6),
+        "median_compute_sec": round(float(np.median(timings_compute)), 6),
+        "throughput_portfolios_per_sec": round(throughput, 2),
+        "peak_ram_mb": max(
+            (r.get("rss_peak_mb") or 0.0) for r in per_rep_telemetry
+        ) or None,
+        "mean_io_read_mb": _safe_median([r.get("io_read_mb") for r in per_rep_telemetry]),
+        "mean_cpu_pct": _safe_median([r.get("cpu_mean_pct") for r in per_rep_telemetry]),
+        "peak_cpu_pct": _safe_max([r.get("cpu_peak_pct") for r in per_rep_telemetry]),
+        "peak_gpu_vram_mb": None,
+        "gpu_utilisation_pct": None,
+    }
+
+    result_doc = {
+        "run_id": run_id,
+        "timestamp": started_at,
+        "config": {
+            **config,
+            "storage_format": storage,
+            "repetitions": repetitions,
+            "warmup": warmup,
+            "drop_cache_attempted": drop_cache,
+        },
+        "hardware": capture_hardware(),
+        "software": capture_software(),
+        "timings_sec": {
+            "load_prices": timings_load,
+            "compute_metrics": timings_compute,
+            "total": timings_total,
+        },
+        "telemetry_per_rep": per_rep_telemetry,
+        "summary": summary,
+        "result_checksum": checksum,
+        "aggregate_stats": aggregate_stats,
+        "notes": notes,
+    }
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / f"{run_id}.json"
     with open(out_path, "w") as f:

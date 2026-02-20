@@ -14,8 +14,10 @@ Parquet (Phase 2):
     parquet_wide_zstd           — single wide Parquet, zstd compression
     parquet_wide_uncompressed   — single wide Parquet, no compression
 
+Arrow IPC (Phase 2.5):
+    arrow_ipc     — Apache Arrow IPC file format (zero-copy mmap, uncompressed)
+
 Future formats (Phase 2+):
-    arrow_ipc     — Apache Arrow IPC (zero-copy, uncompressed)
     hdf5          — HDF5 (traditional quant format)
     zarr          — chunked, cloud-native
 
@@ -33,6 +35,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
@@ -178,10 +181,42 @@ def convert_per_stock_to_parquet(
     return out_dir
 
 
+def convert_wide_to_arrow_ipc(
+    src: Path | None = None,
+) -> Path:
+    """
+    Convert the wide-format price CSV to an Arrow IPC file (uncompressed).
+
+    The Arrow IPC file format supports memory-mapping (zero-copy read) via
+    pa.memory_map(). The file is written to data/parquet/prices_wide.arrow.
+
+    Returns the output Arrow IPC file path.
+    """
+    if src is None:
+        src = PRICES_DIR / "prices_wide.csv"
+
+    out_path = PARQUET_DIR / "prices_wide.arrow"
+    PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+
+    log.info(f"Converting wide CSV → Arrow IPC (uncompressed): {out_path}")
+    df = pd.read_csv(src, index_col="date")
+    table = pa.Table.from_pandas(df, preserve_index=True)
+
+    with pa_ipc.new_file(str(out_path), table.schema) as writer:
+        writer.write_table(table)
+
+    in_mb = src.stat().st_size / 1_048_576
+    out_mb = out_path.stat().st_size / 1_048_576
+    ratio = in_mb / out_mb
+    log.info(f"  CSV: {in_mb:.2f} MB  →  Arrow IPC: {out_mb:.2f} MB  (ratio {ratio:.1f}x)")
+    return out_path
+
+
 def convert_all(
     compressions: list[str] | None = None,
+    arrow: bool = False,
 ) -> None:
-    """Convert price data to all configured Parquet variants."""
+    """Convert price data to all configured Parquet variants (and optionally Arrow IPC)."""
     if compressions is None:
         compressions = ["snappy", "zstd", "none"]
 
@@ -192,18 +227,23 @@ def convert_all(
     # Per-stock: snappy only (compression differences are less interesting per-file)
     convert_per_stock_to_parquet(compression="snappy")
 
-    log.info("All Parquet conversions complete.")
+    if arrow:
+        log.info("=== Phase 2.5: Arrow IPC conversion ===")
+        convert_wide_to_arrow_ipc()
+
+    log.info("All conversions complete.")
     _print_parquet_manifest()
 
 
 def _print_parquet_manifest() -> None:
-    """Log a summary of all Parquet files created."""
-    log.info("\n--- Parquet file manifest ---")
+    """Log a summary of all Parquet and Arrow IPC files created."""
+    log.info("\n--- Data file manifest ---")
     total_mb = 0.0
-    for f in sorted(PARQUET_DIR.rglob("*.parquet")):
-        mb = f.stat().st_size / 1_048_576
-        total_mb += mb
-        log.info(f"  {f.relative_to(ROOT)}: {mb:.2f} MB")
+    for pattern in ("*.parquet", "*.arrow"):
+        for f in sorted(PARQUET_DIR.rglob(pattern)):
+            mb = f.stat().st_size / 1_048_576
+            total_mb += mb
+            log.info(f"  {f.relative_to(ROOT)}: {mb:.2f} MB")
     log.info(f"  Total: {total_mb:.2f} MB")
 
 
@@ -258,6 +298,34 @@ def load_parquet_per_stock() -> tuple[np.ndarray, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Arrow IPC loader
+# ---------------------------------------------------------------------------
+
+def load_arrow_ipc() -> tuple[np.ndarray, list[str]]:
+    """
+    Load the wide-format price data from an Arrow IPC file using memory-mapping.
+
+    Memory-mapping (pa.memory_map) allows Arrow to read data directly from the
+    OS virtual-memory mapping without an extra buffer copy — the zero-copy path.
+    """
+    path = PARQUET_DIR / "prices_wide.arrow"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Arrow IPC file not found: {path}. "
+            "Run: python scripts/convert_to_parquet.py --arrow"
+        )
+    mmap = pa.memory_map(str(path), "r")
+    table = pa_ipc.open_file(mmap).read_all()
+    df = table.to_pandas()
+    if "date" in df.columns:
+        df = df.set_index("date")
+    tickers = df.columns.tolist()
+    returns = _log_returns(df.to_numpy(dtype=np.float64))
+    log.debug(f"arrow_ipc loaded: {returns.shape} from {path.stat().st_size / 1e6:.2f} MB")
+    return returns, tickers
+
+
+# ---------------------------------------------------------------------------
 # Unified loader dispatch
 # ---------------------------------------------------------------------------
 
@@ -284,6 +352,7 @@ def load_returns(
         "parquet_wide_zstd":         lambda: load_parquet_wide("zstd"),
         "parquet_wide_uncompressed": lambda: load_parquet_wide("uncompressed"),
         "parquet_per_stock":         load_parquet_per_stock,
+        "arrow_ipc":                 load_arrow_ipc,
     }
     if storage not in dispatch:
         raise ValueError(
@@ -322,5 +391,8 @@ def storage_size_report() -> dict[str, float]:
         report["parquet_per_stock_total"] = sum(
             f.stat().st_size for f in per_stock_dir.glob("*.parquet")
         ) / 1_048_576
+
+    # Arrow IPC
+    report["arrow_ipc"] = _mb(PARQUET_DIR / "prices_wide.arrow")
 
     return report

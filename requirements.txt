@@ -11,8 +11,17 @@ html5lib>=1.1
 # Numeric compute
 numpy>=1.26.0
 
+# Arrow / Parquet (Phase 2 + 2.5)
+pyarrow>=14.0.0
+
 # Progress and CLI
 tqdm>=4.66.0
 
 # System introspection
 psutil>=5.9.0
+
+# Phase 4: Distributed compute engines (optional — install as needed)
+# uv add pyspark "dask[distributed]" "ray[default]"
+pyspark>=3.5.0
+dask[distributed]>=2024.1.0
+ray[default]>=2.9.0

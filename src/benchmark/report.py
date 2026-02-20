@@ -147,13 +147,16 @@ def load_all_results() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def _infer_phase(implementation: str, storage: str) -> str:
     """Heuristically infer which research phase a run belongs to."""
-    if "parquet" in storage or "arrow" in storage or "hdf5" in storage:
-        return "2_storage_opt"
+    # Phase 4 check first — distributed engines always map to phase 4
+    if implementation in ("spark_local", "dask_local", "ray_local"):
+        return "4_distributed"
+    # Phase 3 compute engines — regardless of storage format
     if implementation in ("numba_parallel", "cupy_gpu", "cpp_openmp",
                           "cpp_blas", "rust_rayon", "rust_ndarray"):
         return "3_compute_opt"
-    if implementation in ("spark_local", "dask_local", "ray_local"):
-        return "4_distributed"
+    # Phase 2 storage formats (numpy_vectorised engine on parquet/arrow/hdf5)
+    if "parquet" in storage or "arrow" in storage or "hdf5" in storage:
+        return "2_storage_opt"
     return "1_csv_baseline"
 
 

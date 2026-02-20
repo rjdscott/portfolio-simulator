@@ -1,0 +1,10 @@
+# Plain Julia environment (not a registered package).
+# Declares only the dependencies needed to run portfolio_compute.jl.
+# juliacall activates this project via Pkg.activate() before Pkg.instantiate().
+
+[deps]
+LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+
+[compat]
+julia = "1.9"
+LoopVectorization = "0.12"
