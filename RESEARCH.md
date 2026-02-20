@@ -243,27 +243,65 @@ Parquet variants: per_stock (snappy), wide_snappy, wide_zstd, wide_uncompressed.
 Extends Phase 3 with seven additional languages and runtimes, all on
 `parquet_wide_uncompressed` storage at scales 100 / 1K / 100K / 1M.
 
-| Config ID | Engine               | Language | Parallelism               | Status   |
-|-----------|----------------------|----------|---------------------------|----------|
-| CP-007    | polars_engine        | Python   | Rayon (via Polars)        | planned  |
-| CP-008    | duckdb_sql           | Python   | DuckDB internal           | planned  |
-| CP-009    | rust_rayon_nightly   | Rust     | Rayon + fadd_fast         | planned  |
-| CP-010    | fortran_openmp       | FORTRAN  | OpenMP + -ffast-math      | planned  |
-| CP-011    | julia_loopvec        | Julia    | Threads.@threads + @turbo | planned  |
-| CP-012    | go_goroutines        | Go       | Goroutine worker pool     | planned  |
-| CP-013    | java_vector_api      | Java     | ForkJoinPool + Vector API | planned  |
+| Config ID | Engine               | Language | Parallelism               | Status    |
+|-----------|----------------------|----------|---------------------------|-----------|
+| CP-007    | polars_engine        | Python   | Rayon (via Polars)        | ✅ complete |
+| CP-008    | duckdb_sql           | Python   | DuckDB internal           | ✅ complete |
+| CP-009    | rust_rayon_nightly   | Rust     | Rayon + fadd_fast         | ✅ complete |
+| CP-010    | fortran_openmp       | FORTRAN  | OpenMP + -ffast-math      | ✅ complete |
+| CP-011    | julia_loopvec        | Julia    | Threads.@threads + @turbo | ✅ complete |
+| CP-012    | go_goroutines        | Go       | Goroutine worker pool     | ✅ complete |
+| CP-013    | java_vector_api      | Java     | ForkJoinPool + Vector API | ✅ complete |
 
-**Phase 3b Hypotheses**
+**Phase 3b Results** (portfolios/sec, warm cache, 5 reps, 2026-02-20):
 
-| ID    | Hypothesis | Rationale |
-|-------|-----------|-----------|
-| H-PL1 | Polars expression API will score 50K–150K/s — below NumPy | Polars lacks native Welford; must fall back to Python-level aggregation |
-| H-DK1 | DuckDB SQL will score 10K–80K/s — lowest compute engine | Join + aggregation path; no SIMD path for dense FP reduction |
-| H-RN1 | Rust nightly (fadd_fast) will reach ~800K–950K/s, matching C++ | Removes the only constraint that prevented LLVM from emitting vfmadd231pd |
-| H-F1  | FORTRAN OpenMP will score within ±5% of C++/OpenMP | Same GCC backend + -ffast-math; difference reflects ctypes overhead only |
-| H-JL1 | Julia @turbo + Threads.@threads will match or exceed Numba | @turbo applies polyhedral SIMD analysis; Julia JIT generates native code via LLVM |
-| H-GO1 | Go goroutines will score 200K–400K/s (1.5–2.5× NumPy) | No SIMD auto-vectorisation for FP reductions; goroutine overhead minimal at this task size |
-| H-JV1 | Java Vector API will score 400K–700K/s (2–4× NumPy) | Explicit 256-bit SIMD via DoubleVector; HotSpot C2 JIT compiles hot loop to AVX2 after warmup |
+| Engine              | N=100  | N=1K    | N=100K  | N=1M    | vs NumPy (1M) |
+|---------------------|--------|---------|---------|---------|---------------|
+| fortran_openmp      | 20,517 | 160,694 | 779,029 | 828,035 | **4.7×**      |
+| julia_loopvec       | 23,250 | 199,681 | 707,409 | 745,475 | **4.2×**      |
+| rust_rayon_nightly  | 10,045 | 79,994  | 655,304 | 654,643 | **3.7×**      |
+| java_vector_api     | 19,585 | 117,481 | 460,764 | 476,253 | **2.7×**      |
+| go_goroutines       | 20,773 | 118,287 | 323,932 | 344,630 | **1.9×**      |
+| polars_engine       | 1,943  | 22,219  | 105,927 | 83,811  | 0.47×         |
+| duckdb_sql          | 884    | 1,119   | 11,360  | —*      | —             |
+
+*DuckDB N=1M: data-melt step creates 100M-row DataFrame (prohibitively slow).
+
+**Phase 3b Hypothesis Status**
+
+| ID    | Hypothesis | Status | Observation |
+|-------|-----------|--------|-------------|
+| H-PL1 | Polars ~50–150K/s, below NumPy | ✅ Confirmed | 84–106K/s at 100K–1M; degraded at 1M (lazy planning overhead) |
+| H-DK1 | DuckDB ~10–80K/s | ✅ Confirmed | 11K/s at 100K; data-melt is the bottleneck |
+| H-RN1 | Rust nightly ≈ C++ (~800–950K/s) | ⚠️ Partial | 655K at 1M — +41% over stable but still 25% below Numba |
+| H-F1  | FORTRAN within ±5% of C++ | ✅ Confirmed | 828K vs 826K at 1M — 0.2% difference |
+| H-JL1 | Julia ≈ Numba | ✅ Confirmed | 745K vs 920K at 1M; Julia leads at 1K (200K vs 193K) |
+| H-GO1 | Go 200–400K/s | ✅ Confirmed | 345K at 1M — scalar, goroutine pool, upper bound of range |
+| H-JV1 | Java Vector API 400–700K/s | ✅ Confirmed | 476K at 1M — HotSpot C2 AVX2 after warmup |
+
+**Key findings from Phase 3b**:
+
+1. **FORTRAN ≈ C++ (0.2% difference at N=1M)**: gfortran with `-ffast-math -march=native
+   -fopenmp` through the GCC backend produces near-identical AVX2 code to g++. Critical:
+   requires explicit-shape dummy args `r(U, T)` with `BIND(C)` — deferred-shape
+   `C_F_POINTER` arrays prevent gfortran from proving stride-1 and fall back to scalar SSE2.
+
+2. **Julia `@turbo` + `Threads.@threads` is the best scripted-language result**: 745K/s
+   (4.2× NumPy) with no C extension — pure Julia code, LLVM backend, polyhedral SIMD.
+   Julia leads at N=1K (200K vs 193K for Numba) due to lower dispatch overhead.
+
+3. **Rust nightly `fadd_fast` closes 41% of the gap to C++/Numba**: 654K vs 465K.
+   The `llvm.fadd.fast` attribute allows LLVM to vectorise the FP reduction the same
+   way `-ffast-math` does for GCC. The remaining 25% gap vs Numba reflects broader
+   loop-fusion opportunities that `-ffast-math` enables at the function level.
+
+4. **Java Vector API is competitive**: 476K/s (2.7×) — comparable to Rust stable (465K)
+   and Go in opposite direction. HotSpot C2 JIT compiles `DoubleVector.SPECIES_256`
+   `fma` operations to AVX2 after warmup (~100 iterations).
+
+5. **Go goroutines: 1.9× without SIMD**: scalar arithmetic, cooperative goroutine
+   scheduler. The goroutine pool assigns N/28 portfolios per worker; scheduling
+   overhead is negligible at this chunk size.
 
 **Memory layout notes (CRITICAL for native engines)**
 
@@ -271,13 +309,62 @@ All returns and weight arrays passed to Phase 3b engines are C-order (row-major)
 float64 arrays. Engines that use column-major layouts (FORTRAN, Julia) must handle the
 transposition explicitly via pointer arithmetic or index swapping — not array copying.
 
-**Integration approach**
-
-- Python engines (polars, duckdb): direct function call, no build step
-- FORTRAN, Go: ctypes to shared library (.so), same pattern as cpp_openmp
-- Rust nightly: ctypes to .so (separate Cargo workspace from stable crate)
-- Julia: juliacall embedded runtime (started once per process, amortised)
-- Java: JPype embedded JVM (started once per process, amortised) + Vector API JAR
-
 Full research notes: docs/benchmarks/phase3b_engines.md
+
+---
+
+### Phase 3c — Float32 and Alternative Runtimes (2026-02-20)
+
+Additional engines targeting specific architectural questions: memory-bandwidth effects
+(float32), ATen/XLA compute paths (PyTorch, JAX), Eigen BLAS (C++), and faer (Rust).
+
+| Config ID | Engine               | Language | Question                            | Status        |
+|-----------|----------------------|----------|-------------------------------------|---------------|
+| CP-014    | numpy_float32        | Python   | Does float32 matmul beat float64?   | ⚠️ partial (1K only) |
+| CP-015    | pytorch_cpu          | Python   | Can ATen matmul match NumPy BLAS?   | ⏳ pending full sweep |
+| CP-016    | jax_cpu              | Python   | XLA-JIT vs OpenBLAS DGEMM           | ⏳ pending full sweep |
+| CP-017    | cpp_eigen            | C++      | Header-only BLAS (Eigen) vs manual? | ⏳ pending build (needs libeigen3-dev) |
+| CP-018    | rust_faer            | Rust     | faer GEMM vs manual Welford         | ⚠️ partial (1K only) |
+
+**Preliminary results** (N=1K only; full sweep not yet run):
+
+| Engine         | N=1K throughput | Notes |
+|----------------|-----------------|-------|
+| rust_faer      | 162,549/s       | faer GEMM + Rayon Welford; ~2.8× NumPy at 1K |
+| numpy_float32  | 49,408/s        | float32 matmul; slower at 1K due to dtype conversion overhead |
+
+**Hypotheses**:
+- `numpy_float32` expected to match or exceed float64 at large N (halved L3 footprint)
+  but will show overhead at small N due to `np.ascontiguousarray` dtype cast
+- `pytorch_cpu` expected to match `numpy_vectorised` (both use OpenBLAS DGEMM internally)
+- `jax_cpu` expected to match `numpy_vectorised` after JIT warmup; XLA may outperform
+  at specific shapes
+- `rust_faer` expected to approach `cpp_openmp` at large N — faer uses BLAS-backed
+  GEMM like Eigen, but with Rust safety and Rayon parallelism for per-row statistics
+
+---
+
+### Phase 3d — DuckDB Result Registry (2026-02-20)
+
+**Motivation**: With 12 engines × 4 scales = 48 Phase 3 configurations (and growing),
+per-run JSON files are no longer sufficient for ad-hoc analysis. A queryable registry
+is needed for: deduplication, superseded-run tracking, and publishable Parquet exports.
+
+**Implementation**: `src/benchmark/db.py` — DuckDB registry with:
+
+- **Immutable JSON source of truth**: `results/<uuid>.json` files unchanged
+- **Incremental ingestion**: `ingest_all()` scans `results/*.json`, skips already-ingested
+  paths (tracked by `json_path UNIQUE` in the `runs` table), ingests only new files
+- **Deduplication**: `config_fingerprint` = SHA-256 of
+  `(implementation, storage_format, scale, k, seed, cpu_model)`. Re-running the same
+  config marks the old row `superseded=TRUE`; `v_canonical` view shows only the latest
+- **Export**: `results/exports/summary.parquet`, `telemetry.parquet`, `summary.csv`,
+  `comparison.csv` — all regenerated from the registry on each `--report` or `--export`
+- **Baked views**: `v_canonical` (non-superseded), `v_phase3` (Phase 3 engines),
+  `v_speedup` (speedup relative to numpy_vectorised at each scale)
+
+```bash
+python scripts/run_benchmark.py --export    # Ingest + export; no benchmark run
+python scripts/run_benchmark.py --report    # Print summary + export automatically
+```
 

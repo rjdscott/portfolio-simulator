@@ -20,8 +20,16 @@ tqdm>=4.66.0
 # System introspection
 psutil>=5.9.0
 
+# DuckDB result registry + Polars (Phase result management)
+duckdb>=0.10.0
+polars>=0.20.0
+
 # Phase 4: Distributed compute engines (optional — install as needed)
 # uv add pyspark "dask[distributed]" "ray[default]"
 pyspark>=3.5.0
 dask[distributed]>=2024.1.0
 ray[default]>=2.9.0
+
+# Large optional installs — install with exact commands below:
+# uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+# uv pip install "jax[cpu]"

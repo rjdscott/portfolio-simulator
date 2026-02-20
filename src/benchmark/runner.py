@@ -361,6 +361,31 @@ def _make_run_fn(storage: str, engine: str, port_df: pd.DataFrame):
         elif engine == "java_vector_api":
             from src.compute.java_vector_api import compute_java_vector_api
             results = compute_java_vector_api(returns, weights)
+        # Phase 3c engines (C++ micro-arch optimisations)
+        elif engine == "cpp_openmp_unroll":
+            from src.compute.cpp_openmp_unroll import compute_cpp_openmp_unroll
+            results = compute_cpp_openmp_unroll(returns, weights)
+        elif engine == "cpp_openmp_tile4":
+            from src.compute.cpp_openmp_tile4 import compute_cpp_openmp_tile4
+            results = compute_cpp_openmp_tile4(returns, weights)
+        elif engine == "cpp_openmp_clang":
+            from src.compute.cpp_openmp_clang import compute_cpp_openmp_clang
+            results = compute_cpp_openmp_clang(returns, weights)
+        elif engine == "numpy_float32":
+            from src.compute.numpy_float32 import compute_numpy_float32
+            results = compute_numpy_float32(returns, weights)
+        elif engine == "pytorch_cpu":
+            from src.compute.pytorch_cpu import compute_pytorch_cpu
+            results = compute_pytorch_cpu(returns, weights)
+        elif engine == "jax_cpu":
+            from src.compute.jax_cpu import compute_jax_cpu
+            results = compute_jax_cpu(returns, weights)
+        elif engine == "cpp_eigen":
+            from src.compute.cpp_eigen import compute_cpp_eigen
+            results = compute_cpp_eigen(returns, weights)
+        elif engine == "rust_faer":
+            from src.compute.rust_faer import compute_rust_faer
+            results = compute_rust_faer(returns, weights)
         else:
             raise ValueError(f"Unknown engine: '{engine}'")
         pt.stop("compute_metrics")

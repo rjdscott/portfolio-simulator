@@ -1,11 +1,30 @@
-# Phase 3b — Candidate Compute Engine Analysis
+# Phase 3b / 3c — Extended Compute Engine Analysis
 
 **Date recorded:** 2026-02-20
-**Status:** Research complete; implementation in progress
+**Status:** Phase 3b complete (7 engines, full sweep); Phase 3c partial (preliminary N=1K runs)
 **Context:** Following Phase 3's finding that portfolio-parallel Welford outperforms BLAS
-at every scale, this phase extends the compute engine comparison to seven additional
-languages and runtimes: Java (Vector API), Polars, Rust nightly (`fadd_fast`), DuckDB,
-FORTRAN, Julia, and Go.
+at every scale, these phases extend the compute engine comparison to eleven additional
+engines across 7 languages and runtimes: Java (Vector API), Polars, Rust nightly
+(`fadd_fast`), Rust faer, DuckDB, FORTRAN, Julia, Go, NumPy float32, PyTorch CPU, and JAX.
+
+## Phase 3b Results Summary
+
+| Engine              | N=100  | N=1K    | N=100K  | N=1M    | vs NumPy (1M) |
+|---------------------|--------|---------|---------|---------|---------------|
+| fortran_openmp      | 20,517 | 160,694 | 779,029 | 828,035 | **4.7×**      |
+| julia_loopvec       | 23,250 | 199,681 | 707,409 | 745,475 | **4.2×**      |
+| rust_rayon_nightly  | 10,045 | 79,994  | 655,304 | 654,643 | **3.7×**      |
+| java_vector_api     | 19,585 | 117,481 | 460,764 | 476,253 | **2.7×**      |
+| go_goroutines       | 20,773 | 118,287 | 323,932 | 344,630 | **1.9×**      |
+| polars_engine       | 1,943  | 22,219  | 105,927 | 83,811  | 0.47×         |
+| duckdb_sql          | 884    | 1,119   | 11,360  | —       | —             |
+
+## Phase 3c Preliminary Results (N=1K only)
+
+| Engine         | N=1K    | Notes |
+|----------------|---------|-------|
+| rust_faer      | 162,549 | faer BLAS GEMM + Rayon Welford |
+| numpy_float32  | 49,408  | float32 dtype; cast overhead dominates at small N |
 
 ---
 
@@ -489,6 +508,8 @@ tolerances of ±1e-10 (strict IEEE) or ±1e-6 (fast-math engines).
 
 ## Build Prerequisites Summary
 
+### Phase 3b
+
 | Engine              | New dependency         | Available check |
 |---------------------|------------------------|-----------------|
 | polars_engine       | polars                 | `python -c "import polars"` |
@@ -498,3 +519,88 @@ tolerances of ±1e-10 (strict IEEE) or ±1e-6 (fast-math engines).
 | julia_loopvec       | julia binary + juliacall | `julia --version` |
 | go_goroutines       | go 1.22+               | `go version` |
 | java_vector_api     | java 21+ + jpype1      | `java -version` |
+
+---
+
+## Phase 3c — Float32 and Alternative Runtimes
+
+**Date added:** 2026-02-20
+**Status:** Implemented; preliminary N=1K runs complete; full sweep pending
+
+### Motivation
+
+Phase 3b established that the top single-machine engines (Numba, C++, FORTRAN, Julia)
+achieve 750–920K portfolios/sec via parallel Welford + SIMD. Phase 3c investigates
+three additional questions:
+
+1. **Memory bandwidth vs compute**: Does halving the working set size (float32 vs float64)
+   improve throughput at large N where L3 cache is saturated?
+2. **ML framework overhead**: Can PyTorch (ATen backend) and JAX (XLA backend) match
+   NumPy/OpenBLAS for this specific GEMM + statistics workload?
+3. **BLAS-in-Rust**: Does faer's BLAS-backed GEMM approach (similar to Eigen in C++)
+   offer a better trade-off than the manual Welford loop in `rust_rayon`?
+
+### Engine Descriptions
+
+#### `numpy_float32`
+
+- **Mechanism**: Cast `(T, U)` returns and `(N, U)` weights to float32 before matmul;
+  upcast result to float64 for statistics computation.
+- **Key code**: `W = np.ascontiguousarray(weights, dtype=np.float32)`;
+  `port_returns = (W @ R.T).astype(np.float64)`
+- **Hypothesis**: At N≥100K where L3 is saturated, halving the data footprint should
+  improve BLAS throughput. At small N the dtype cast overhead dominates.
+- **Checksum behaviour**: Results differ from float64 engines by ~1e-6 (expected;
+  documented in `notes` field of each result JSON).
+- **Preliminary result**: 49K/s at N=1K (below NumPy float64 57K/s due to cast overhead)
+
+#### `pytorch_cpu`
+
+- **Mechanism**: `torch.from_numpy()` (zero-copy, no data movement) → `W @ R.T` via
+  PyTorch's ATen backend → `.numpy()` zero-copy view for statistics.
+- **Expected**: Matches `numpy_vectorised` — both call OpenBLAS DGEMM internally.
+  Any difference reflects ATen dispatch overhead (typically <5%).
+- **Install**: `uv pip install torch --index-url https://download.pytorch.org/whl/cpu`
+
+#### `jax_cpu`
+
+- **Mechanism**: Module-level `os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")`;
+  `@jax.jit`-compiled kernel with `W @ R.T` + vectorised statistics.
+- **Bessel correction**: `jnp.std` defaults to ddof=0; must apply
+  `* jnp.sqrt(T / (T - 1))` to match the ddof=1 convention used by all other engines.
+- **JIT warmup**: Compilation occurs on first call (~5–30 s); handled by benchmark warmup rep.
+- **Expected**: Matches `numpy_vectorised` post-warmup; XLA may show advantages at
+  specific matrix shapes via loop fusion.
+- **Install**: `uv pip install "jax[cpu]"`
+
+#### `cpp_eigen`
+
+- **Mechanism**: `Eigen::Map<const MatrixXdRowMajor>` zero-copy wrapping of C arrays;
+  `W * R.T` via Eigen's BLAS-backed GEMM; `#pragma omp parallel for` for per-row stats.
+- **Compile flags**: same as `cpp_openmp`: `-O3 -march=native -ffast-math -funroll-loops`
+- **Same ABI**: `extern "C" void compute_portfolio_metrics(r, w, results, n, t, u)`
+- **Build**: `sudo apt install libeigen3-dev` + cmake (pending on this machine)
+- **Expected**: Comparable to `cpp_openmp` at large N; Eigen's BLAS GEMM vs manual SIMD
+  loop is the key comparison.
+
+#### `rust_faer`
+
+- **Mechanism**: `Mat::from_fn(t, u, |i, j| r_slice[i*u+j])` copies C-order array to
+  faer's column-major layout; `matmul::matmul(..., Parallelism::Rayon(0))` for GEMM;
+  `par_chunks_mut(2)` with Welford for per-portfolio statistics.
+- **API note**: faer 0.20 has no `MatRef::from_raw_parts` or
+  `from_column_major_slice` — `Mat::from_fn` is the only correct path and involves
+  a layout-conversion copy (row-major → column-major).
+- **Build**: `cargo build --release --manifest-path implementations/rust/faer/Cargo.toml`
+  (stable toolchain; no nightly required)
+- **Preliminary result**: 162K/s at N=1K — competitive with `numpy_vectorised` (58K/s)
+
+### Phase 3c Build Prerequisites
+
+| Engine         | New dependency            | Available check |
+|----------------|---------------------------|-----------------|
+| numpy_float32  | (none — in core deps)     | always available |
+| pytorch_cpu    | torch (CPU-only wheel)    | `python -c "import torch"` |
+| jax_cpu        | jax[cpu]                  | `python -c "import jax"` |
+| cpp_eigen      | libeigen3-dev + cmake     | `dpkg -l libeigen3-dev` |
+| rust_faer      | faer = "0.20" (Cargo.toml)| `cargo build --release ...faer/Cargo.toml` |

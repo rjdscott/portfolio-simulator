@@ -141,7 +141,31 @@ PHASE3B_CONFIGS = [
         ("julia_loopvec",      "julia"),
         ("go_goroutines",      "go"),
         ("java_vector_api",    "java"),
+        # New engines from plan (skip gracefully if deps missing)
+        ("numpy_float32",      "python"),
+        ("pytorch_cpu",        "python"),
+        ("jax_cpu",            "python"),
+        ("cpp_eigen",          "cpp"),
+        ("rust_faer",          "rust"),
     ]
+    for scale in (100, 1_000, 100_000, 1_000_000)
+]
+
+# ---------------------------------------------------------------------------
+# Phase 3c: C++ micro-arch optimisations — 3 new engines vs baseline cpp_openmp
+# Storage fixed at parquet_wide_uncompressed. 3 engines × 4 scales = 12 configs.
+# ---------------------------------------------------------------------------
+PHASE3C_CONFIGS = [
+    {
+        "implementation": eng,
+        "language": "cpp",
+        "storage_format": "parquet_wide_uncompressed",
+        "portfolio_scale": scale,
+        "portfolio_k": 15,
+        "universe_size": 100,
+        "seed": 42,
+    }
+    for eng in ("cpp_openmp_unroll", "cpp_openmp_tile4", "cpp_openmp_clang")
     for scale in (100, 1_000, 100_000, 1_000_000)
 ]
 
@@ -171,6 +195,7 @@ ALL_PHASES = {
     2: PHASE2_CONFIGS,
     3: PHASE3_CONFIGS,
     "3b": PHASE3B_CONFIGS,
+    "3c": PHASE3C_CONFIGS,
     4: PHASE4_CONFIGS,
 }
 
@@ -235,6 +260,16 @@ def main():
                             "julia_loopvec",
                             "go_goroutines",
                             "java_vector_api",
+                            # Phase 3c (C++ micro-arch optimisations)
+                            "cpp_openmp_unroll",
+                            "cpp_openmp_tile4",
+                            "cpp_openmp_clang",
+                            # New plan engines
+                            "numpy_float32",
+                            "pytorch_cpu",
+                            "jax_cpu",
+                            "cpp_eigen",
+                            "rust_faer",
                             # Phase 4
                             "spark_local",
                             "dask_local",
@@ -252,6 +287,8 @@ def main():
                              "Choices: 1, 2, 3, 3b, 4 (repeatable: --phase 3 --phase 3b)")
     parser.add_argument("--report", action="store_true",
                         help="Print aggregated report of all results and exit")
+    parser.add_argument("--export", action="store_true",
+                        help="Ingest all JSONs into registry.duckdb and write results/exports/")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -260,6 +297,16 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
+
+    if args.export:
+        from src.benchmark.db import get_connection, ingest_all, export_parquet, export_csv
+        con = get_connection()
+        n = ingest_all(con=con)
+        logging.getLogger(__name__).info(f"Ingested {n} new run(s).")
+        export_parquet(con=con)
+        export_csv(con=con)
+        con.close()
+        return
 
     if args.report and not args.phases and not args.scale:
         report.run()
@@ -284,8 +331,13 @@ def main():
     scale = SCALE_MAP[args.scale]
     _engine_language = {
         "cpp_openmp":          "cpp",
+        "cpp_openmp_unroll":   "cpp",
+        "cpp_openmp_tile4":    "cpp",
+        "cpp_openmp_clang":    "cpp",
+        "cpp_eigen":           "cpp",
         "rust_rayon":          "rust",
         "rust_rayon_nightly":  "rust",
+        "rust_faer":           "rust",
         "fortran_openmp":      "fortran",
         "julia_loopvec":       "julia",
         "go_goroutines":       "go",

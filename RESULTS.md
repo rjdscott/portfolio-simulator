@@ -1,6 +1,6 @@
 # Portfolio Return Simulator — Results
 
-> **Generated**: 2026-02-20 12:45 UTC  |  **Git**: `dd9bcae`  |  **Runs**: 26 (Ph1/2) + 16 (Ph3) + 24 (Ph3b)
+> **Generated**: 2026-02-20  |  **Git**: `dd9bcae`+  |  **Runs**: 26 (Ph1/2) + 16 (Ph3) + 24 (Ph3b) + preliminary (Ph3c)
 
 Benchmarks cover 4 phase(s), portfolio scales 100 – 1M.
 Metrics: annualised Sharpe ratio + cumulative return over 1,257 trading days,
@@ -20,10 +20,11 @@ K = 15 stocks per portfolio, 100-stock universe (top S&P 500 by market cap, 2020
 8. [Speedup vs Baseline](#8-speedup-vs-baseline)
 9. [Phase 3 — Compute Engine Comparison](#9-phase-3--compute-engine-comparison)
 10. [Phase 3b — Extended Engine Survey](#10-phase-3b--extended-engine-survey)
-11. [Projections](#11-projections)
-12. [Key Findings](#12-key-findings)
-13. [Hypothesis Status](#13-hypothesis-status)
-14. [Open Questions](#14-open-questions)
+11. [Phase 3c — Float32 and Alternative Runtimes](#11-phase-3c--float32-and-alternative-runtimes)
+12. [Projections](#12-projections)
+13. [Key Findings](#13-key-findings)
+14. [Hypothesis Status](#14-hypothesis-status)
+15. [Open Questions](#15-open-questions)
 
 ---
 
@@ -46,7 +47,10 @@ K = 15 stocks per portfolio, 100-stock universe (top S&P 500 by market cap, 2020
 | :------ | :-------- |
 | NumPy   | 2.4.2     |
 | pyarrow | 23.0.1    |
-| Git SHA | `a206391` |
+| duckdb  | 1.4.4     |
+| polars  | 1.38.1    |
+| faer    | 0.20.2    |
+| Git SHA | `dd9bcae`+ |
 
 ### Benchmark Protocol
 
@@ -353,7 +357,42 @@ fully-native DuckDB pipeline reading from Parquet directly would avoid this).
 
 ---
 
-## 11. Projections
+## 11. Phase 3c — Float32 and Alternative Runtimes
+
+> Preliminary runs only (N=1K verification; full 4-scale sweep pending).
+> Storage: `parquet_wide_uncompressed`. Warm cache, 3 reps.
+
+### Preliminary Throughput (N=1K)
+
+| Engine         | N=1K throughput | Notes |
+| :------------- | --------------: | :---- |
+| rust_faer      |     162,549/s   | faer GEMM (BLAS-backed) + Rayon Welford stats |
+| numpy_vectorised |    57,887/s   | Phase 3 baseline at N=1K |
+| numpy_float32  |      49,408/s   | float32 dtype; overhead from `ascontiguousarray` cast dominates at small N |
+
+### Engine Descriptions
+
+| Engine | Mechanism | Expected advantage |
+| :----- | :-------- | :----------------- |
+| `rust_faer` | faer 0.20 BLAS-backed GEMM + Rayon `par_chunks_mut` for Welford stats | GEMM replaces manual Welford inner loop; faer auto-parallelises via Rayon |
+| `numpy_float32` | Cast `(T, U)` returns and `(N, U)` weights to float32 before `W @ R.T`; upcast to float64 for statistics | Halves L3 cache footprint — expected to match or exceed float64 at N≥100K |
+| `pytorch_cpu` | `torch.from_numpy()` zero-copy tensors; `W @ R.T` via PyTorch ATen (OpenBLAS) | Same BLAS path as NumPy; measures ATen dispatch overhead |
+| `jax_cpu` | JAX `@jit`-compiled `W @ R.T` + Welford; XLA backend | JIT warmup handled by benchmark warmup rep |
+| `cpp_eigen` | `Eigen::Map<MatrixXdRowMajor>` zero-copy + BLAS GEMM + OpenMP stats loop | Eigen header-only; same `-ffast-math` flags as `cpp_openmp` |
+
+### Implementation Notes
+
+- **`rust_faer` API**: faer 0.20 does not expose `MatRef::from_raw_parts`. C-order
+  (row-major) arrays are loaded via `Mat::from_fn(nrows, ncols, |i, j| slice[i*ncols+j])`
+  which copies to faer's column-major layout. This is the only correct path in faer 0.20.
+- **`numpy_float32` checksum**: float32 arithmetic produces results differing from float64
+  engines by ~1e-6; this is expected and documented in each run's `notes` field.
+- **`cpp_eigen` build**: requires `sudo apt install libeigen3-dev`; CMake build
+  is otherwise identical to `cpp_openmp`. Build pending on this machine.
+
+---
+
+## 12. Projections
 
 > Extrapolated from N = 1M observed rates (warm cache). RAM assumes linear scaling.
 > Phase 4 (Spark, Dask, Ray) targets N = 1M–1B via seeded batch generation.
@@ -364,14 +403,21 @@ fully-native DuckDB pipeline reading from Parquet directly would avoid this).
 | fortran_openmp     |       828K/s    |         2.0 min  |       20 min   | Tied with C++ OpenMP; AVX2 via gfortran |
 | cpp_openmp         |       826K/s    |         2.0 min  |       20 min   | Phase 3 |
 | julia_loopvec      |       745K/s    |         2.2 min  |       22 min   | Best Phase 3b (scripted lang) |
+| rust_rayon_nightly |       655K/s    |         2.5 min  |       25 min   | +41% over stable via fadd_fast |
+| java_vector_api    |       476K/s    |         3.5 min  |       35 min   | JVM AVX2 via Vector API |
+| rust_rayon         |       465K/s    |         3.6 min  |       36 min   | Stable, 8-wide accumulators |
+| rust_faer          |        —†       |              —   |          —     | Partial (N=1K only) |
+| numpy_float32      |        —†       |              —   |          —     | Partial (N=1K only) |
 | numpy_vectorised   |       178K/s    |         9.4 min  |       94 min   | Baseline |
 | spark_local        |    pending Ph4  |             —    |          —     | Seeded batch |
 | dask_local         |    pending Ph4  |             —    |          —     | Seeded batch |
 
+†Full sweep not yet run; see Phase 3c section.
+
 > N = 100M: weight matrix (100M × 100 × 4B = 40 GB) exceeds available RAM — requires
 > seeded on-the-fly generation (Phase 4). Numba at 920K/s → 100M portfolios in ~108 s (wall-clock).
 
-## 12. Key Findings
+## 13. Key Findings
 
 ### Finding 1 — Storage format only matters at small N
 
@@ -421,7 +467,7 @@ seeded batch generation.
 
 ---
 
-## 13. Hypothesis Status
+## 14. Hypothesis Status
 
 | ID | Hypothesis | Status | Evidence |
 | :- | :--------- | :----: | :------- |
@@ -439,7 +485,7 @@ seeded batch generation.
 | H-JV1 | Java Vector API ~400–700K/s | ✅ Confirmed | 461K (100K) and 476K (1M) — HotSpot JIT compiles AVX2 after warmup |
 | H-F1  | FORTRAN within ±5% of C++ OpenMP | ✅ Confirmed | 828K vs 826K at N=1M (0.2%); AVX2 requires explicit-shape `BIND(C)` dummy args, not `C_F_POINTER` |
 
-## 14. Open Questions
+## 15. Open Questions
 
 1. **Cold-cache I/O**: all benchmarks ran with warm OS page cache (`io_read_mb = 0`
    for all formats). True cold-read numbers require `sudo` to flush the page cache.

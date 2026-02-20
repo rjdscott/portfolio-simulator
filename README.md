@@ -42,18 +42,24 @@ at each scale.
 | pyarrow    | 23.0.1   | Parquet I/O                               |
 | numba      | 0.64.0   | JIT compiler (Phase 3)                    |
 | llvmlite   | 0.46.0   | Numba LLVM backend                        |
+| duckdb     | 1.4.4    | SQL compute engine + result registry      |
+| polars     | 1.38.1   | DataFrame engine (Rust/Rayon backend)     |
 | psutil     | —        | Telemetry (CPU %, RSS, I/O counters)      |
 | cupy       | optional | GPU compute via CUDA (Phase 3)            |
+| torch      | optional | CPU matmul via PyTorch ATen               |
+| jax        | optional | XLA-compiled CPU kernels                  |
 
 ### Native toolchain
 
 | Tool        | Version  | Role                                      |
 |-------------|----------|-------------------------------------------|
-| GCC / g++   | 13.3.0   | C++ compiler                              |
-| CMake       | 3.28.3   | Cross-platform C++ build system           |
-| OpenMP      | 4.5      | C++ thread parallelism                    |
-| Rust        | 1.93.1   | Rust compiler (via rustup)                |
+| GCC / g++   | 13.3.0   | C++ and FORTRAN compiler                  |
+| CMake       | 3.28.3   | Cross-platform C++ / FORTRAN build system |
+| OpenMP      | 4.5      | Thread parallelism (C++, FORTRAN)         |
+| Rust        | 1.93.1   | Rust compiler (stable, via rustup)        |
 | Rayon       | 1.11.0   | Rust data-parallelism library             |
+| faer        | 0.20.2   | Rust BLAS-backed dense linear algebra     |
+| Eigen3      | 3.4.0    | C++ header-only linear algebra (optional) |
 
 ---
 
@@ -126,7 +132,7 @@ Compute fixed at `numpy_vectorised`. Compare CSV vs Parquet variants.
 ### Phase 3 — Compute engine comparison
 Storage fixed at `parquet_wide_uncompressed`. Vary the compute engine.
 
-**Engines** (warm cache, 5 reps each, 2026-02-20):
+**Core engines** (warm cache, 5 reps each, 2026-02-20):
 
 | Engine           | Language | Parallelism                           |
 |------------------|----------|---------------------------------------|
@@ -148,39 +154,91 @@ Storage fixed at `parquet_wide_uncompressed`. Vary the compute engine.
 **Findings**:
 
 1. **The "BLAS holds at large N" hypothesis is disproved.** Every Phase 3 engine
-   beats NumPy/OpenBLAS at every scale from N=100 to N=1M. BLAS DGEMM allocates
-   a full (N, T) output matrix and is memory-bandwidth bound; per-portfolio Welford
-   loops hold weights in L1 and read the shared 1 MB returns matrix from L3,
-   achieving better arithmetic intensity.
+   beats NumPy/OpenBLAS at every scale from N=100 to N=1M.
 
 2. **Numba and C++ are neck-and-neck (~830–940K/s at large N).** C++ leads at
    N=100K (937K vs 846K) due to lower JIT dispatch overhead; Numba pulls ahead at
-   N=1M (920K vs 826K) via `fastmath=True` LLVM loop fusion. Both run at 100% CPU
-   on all 28 threads.
+   N=1M (920K vs 826K) via `fastmath=True` LLVM loop fusion.
 
-3. **C++ requires `-ffast-math` to be competitive.** Without it, GCC treats
-   floating-point reduction as non-associative (strict IEEE 754) and the inner
-   dot-product loop `Σ w[u] × r[u]` over U=100 stocks runs entirely scalar — making
-   C++ *slower* than NumPy. Adding `-ffast-math`, `__restrict__`, and
-   `#pragma omp simd reduction(+:port_r)` unlocks AVX2/FMA and gives the 4.7× gain.
+3. **C++ requires `-ffast-math` to be competitive.** Without it, GCC emits entirely
+   scalar code for the inner dot-product loop. Adding `-ffast-math`, `__restrict__`,
+   and `#pragma omp simd reduction(+:port_r)` unlocks AVX2/FMA.
 
-4. **Rust stable Rayon achieves 2.6× NumPy** but trails C++/Numba by ~1.9×.
-   Stable Rust has no `-ffast-math` equivalent at the language level. The workaround
-   — 8 independent accumulators — allows LLVM to pack them into two AVX2 `ymm`
-   registers and emit `vfmadd231pd`, but GCC with `-ffast-math` applies broader
-   reassociation across the full reduction. Closing the gap would require nightly
-   Rust (`std::intrinsics::fadd_fast`) or an explicit SIMD crate (`wide`, `std::simd`).
-
-All engines use **Welford's online algorithm** for variance (ddof=1, numerically
-stable, single pass) to ensure cross-implementation numerical agreement. Float
-differences at ~1e-14 are expected due to different FP accumulation order and are
-documented in each result's `result_checksum` field.
+4. **Rust stable Rayon achieves 2.6× NumPy** but trails C++/Numba by ~1.9×. Stable
+   Rust has no `-ffast-math` equivalent at the language level.
 
 ---
 
-### Phase 4 — Distributed scale *(planned)*
-PySpark local cluster and/or Dask for N≥10M portfolios. Seeded on-the-fly portfolio
-generation replaces materialised weight files (>10M rows is impractical to store).
+### Phase 3b — Extended engine survey
+Eleven additional compute engines spanning 7 languages / runtimes, all using
+`parquet_wide_uncompressed` storage at scales 100 / 1K / 100K / 1M.
+
+**Results** (portfolios/sec, warm cache, 5 reps):
+
+| Engine              | N=100  | N=1K    | N=100K  | N=1M    | vs NumPy (1M) |
+|---------------------|--------|---------|---------|---------|---------------|
+| numba_parallel      | 25,641 | 193,125 | 846,224 | 919,968 | **5.2×**      |
+| fortran_openmp      | 20,517 | 160,694 | 779,029 | 828,035 | **4.7×**      |
+| cpp_openmp          | 28,944 | 190,404 | 936,900 | 826,211 | **4.7×**      |
+| julia_loopvec       | 23,250 | 199,681 | 707,409 | 745,475 | **4.2×**      |
+| rust_rayon_nightly  | 10,045 | 79,994  | 655,304 | 654,643 | **3.7×**      |
+| rust_faer           | —      | 162,549 | —       | —       | —†            |
+| java_vector_api     | 19,585 | 117,481 | 460,764 | 476,253 | **2.7×**      |
+| rust_rayon          | 23,838 | 115,674 | 494,044 | 465,250 | **2.6×**      |
+| go_goroutines       | 20,773 | 118,287 | 323,932 | 344,630 | **1.9×**      |
+| numpy_float32       | —      | 49,408  | —       | —       | —†            |
+| numpy_vectorised    | 20,194 | 57,887  | 170,007 | 177,572 | 1×            |
+| polars_engine       | 1,943  | 22,219  | 105,927 | 83,811  | 0.47×         |
+| duckdb_sql          | 884    | 1,119   | 11,360  | —‡      | —             |
+
+† `rust_faer` and `numpy_float32` have been benchmarked at N=1K only; full sweep pending.
+‡ DuckDB N=1M: the data-melt step (100M rows) is prohibitively slow; a native Parquet
+pipeline (bypassing PyArrow) would avoid this overhead.
+
+**Key findings**:
+- **FORTRAN ties C++ OpenMP** (828K vs 826K at N=1M, 0.2% difference) — gfortran
+  `-ffast-math -march=native` through the GCC backend produces identical AVX2 code
+- **Julia matches C++ OpenMP at 1M** (745K) and actually leads at N=1K (200K vs 190K)
+- **Rust nightly `fadd_fast` closes 41% of the Rust stable gap** (654K vs 465K)
+- **Java Vector API (476K) is competitive with Rust stable (465K)** — HotSpot C2 JIT
+  compiles `DoubleVector.SPECIES_256` to AVX2 after warmup
+- **faer (Rust) achieves 162K/s at N=1K** in early testing — full sweep pending
+
+---
+
+### Phase 4 — Distributed scale
+PySpark, Dask, and Ray for N≥1M portfolios. Seeded on-the-fly portfolio generation
+replaces materialised weight files above N=10M.
+
+---
+
+## Result Registry (DuckDB)
+
+All benchmark runs are persisted as individual JSON files in `results/<uuid>.json`
+(immutable source of truth). A DuckDB registry (`results/registry.duckdb`) provides
+a queryable index built incrementally from those JSONs.
+
+```bash
+# Ingest new JSONs and export publish-ready Parquet + CSV
+python scripts/run_benchmark.py --export
+
+# Or as part of the report command
+python scripts/run_benchmark.py --report
+```
+
+Exports written to `results/exports/`:
+
+| File | Description |
+|------|-------------|
+| `summary.parquet` | One row per run, all metadata + metrics |
+| `telemetry.parquet` | Per-rep I/O, CPU%, RSS for every run |
+| `summary.csv` | Same as summary.parquet in CSV format |
+| `telemetry.csv` | Same as telemetry.parquet in CSV format |
+| `comparison.csv` | Throughput pivot: (engine, storage) × scale |
+
+**Deduplication**: Re-running the same configuration (same engine, storage, scale,
+seed, CPU) marks the previous row `superseded=TRUE`; the `v_canonical` view always
+shows only the latest non-superseded row per fingerprint.
 
 ---
 
@@ -194,34 +252,32 @@ generation replaces materialised weight files (>10M rows is impractical to store
 | BLAS is not optimal for this workload | Portfolio-parallel Welford beats DGEMM 5× at N=1M |
 | C++ fast-math is non-negotiable | Scalar fallback without `-ffast-math` is slower than Python/NumPy |
 | Numba is a practical near-C++ path | 5.2× NumPy with pure Python syntax; `cache=True` amortises JIT cost |
-| Rust stable has a vectorisation gap | 2.6× NumPy; `fast-math` equivalent only available on nightly |
+| FORTRAN ≈ C++ at peak throughput | Same GCC backend + `-ffast-math` → identical AVX2 code |
+| Julia ≈ C++ via `@turbo` + threads | 4.2× NumPy; wins at small N; no manual SIMD required |
+| Rust nightly closes the fast-math gap | +41% over stable; `fadd_fast` unlocks `vfmadd231pd` reduction |
+| JVM can do SIMD (with Vector API) | Java 476K/s (2.7×); comparable to Rust stable |
 
 ---
 
 ## Next Steps
 
-### Phase 4 — Seeded generation + distributed compute (N=10M to 1B)
-- Implement seeded on-the-fly portfolio generation (no materialisation above 10M)
+### Phase 3 — Remaining engines
+- Full sweep (all 4 scales) for `rust_faer`, `numpy_float32`, `pytorch_cpu`, `jax_cpu`, `cpp_eigen`
+- `cpp_eigen` build requires `sudo apt install libeigen3-dev`
+
+### Phase 4 — Distributed compute (N=1M to 1B)
 - PySpark local cluster: partition N portfolios across cores, broadcast returns matrix
 - Dask delayed graph: compare scheduling overhead vs Spark at intermediate N
-- Target scales: 10M, 100M, 1B portfolios
+- Ray actors: fine-grained task dispatch model
+- Target scales: 1M, 10M, 100M, 1B portfolios
 
 ### Phase 5 — GPU at scale (N≥1M)
 - CuPy on CUDA GPU: PCIe transfer overhead expected to amortise above N≈500K
-- Compare GPU matmul (CuPy `W @ R.T`) vs CPU-parallel Welford at N=1M, 10M
-- Explore mixed strategy: GPU for compute, CPU threads for I/O prefetch
+- Mixed strategy: GPU for compute, CPU threads for I/O prefetch
 
 ### Phase 6 — Cold-cache benchmarks
 - Requires `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'` between runs
-- Quantify NVMe read latency contribution separately from compute
-- Expected to significantly widen the per-stock vs wide-format gap at small N
-
-### Improvements to existing phases
-- **Rust nightly**: enable `std::intrinsics::fadd_fast` to close the ~1.9× gap vs C++
-- **Kotlin/JVM**: add JVM baseline using `DoubleArray` and coroutines for Phase 3
-- **BLAS tuning**: benchmark `OMP_NUM_THREADS` sweep to find OpenBLAS saturation point
-- **Cold vs warm cache comparison**: quantify the page-cache warm-up effect for each
-  storage format
+- Quantify NVMe read latency separately from compute
 
 ---
 
@@ -236,7 +292,7 @@ uv venv --python 3.11
 source .venv/bin/activate
 
 # Core Python dependencies
-uv pip install numpy pandas pyarrow psutil
+uv pip install numpy pandas pyarrow psutil duckdb polars
 ```
 
 ### Phase 1 & 2
@@ -257,8 +313,11 @@ python scripts/run_benchmark.py --phase 1
 # Run Phase 2 (storage comparison)
 python scripts/run_benchmark.py --phase 2
 
-# Print aggregated report
+# Print aggregated report and update result registry
 python scripts/run_benchmark.py --report
+
+# Export publish-ready Parquet (results/exports/)
+python scripts/run_benchmark.py --export
 ```
 
 ### Phase 3 — native engine setup
@@ -274,6 +333,9 @@ python scripts/run_benchmark.py --engine rust_rayon     --storage parquet_wide_u
 
 # Full Phase 3 suite (16 configurations)
 python scripts/run_benchmark.py --phase 3
+
+# Full Phase 3b suite (all 11 additional engines × 4 scales)
+python scripts/run_benchmark.py --phase 3b
 ```
 
 **Manual build steps** (if `setup_phase3.sh` is not used):
@@ -282,16 +344,34 @@ python scripts/run_benchmark.py --phase 3
 # Numba
 uv pip install "numba>=0.59.0"
 
-# C++ OpenMP (requires cmake ≥3.16 and g++ with OpenMP 4.5)
+# C++ OpenMP
 cmake -S implementations/cpp/openmp -B implementations/cpp/openmp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build implementations/cpp/openmp/build --parallel
 
-# Rust/Rayon (requires rustup / cargo)
+# C++ Eigen (requires libeigen3-dev)
+sudo apt install libeigen3-dev
+cmake -S implementations/cpp/eigen -B implementations/cpp/eigen/build -DCMAKE_BUILD_TYPE=Release
+cmake --build implementations/cpp/eigen/build --parallel
+
+# Rust stable (rust_rayon engine)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-cd implementations/rust/rayon && cargo build --release
+cargo build --release --manifest-path implementations/rust/rayon/Cargo.toml
 
-# CuPy (optional, requires CUDA 12.x GPU)
+# Rust faer (rust_faer engine)
+cargo build --release --manifest-path implementations/rust/faer/Cargo.toml
+
+# Rust nightly (rust_rayon_nightly engine)
+rustup toolchain install nightly
+cargo +nightly build --release --manifest-path implementations/rust/rayon_nightly/Cargo.toml
+
+# PyTorch CPU
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# JAX CPU
+uv pip install "jax[cpu]"
+
+# CuPy (optional, requires CUDA 12.x)
 uv pip install cupy-cuda12x
 ```
 
@@ -307,41 +387,91 @@ portfolio-simulator/
 │   │   ├── metadata/            # universe.csv, data_manifest.json
 │   │   └── portfolios/          # portfolios_<N>.csv weight files
 │   └── parquet/                 # Parquet conversions (Phase 2)
+│       └── prices_wide.arrow    # Arrow IPC zero-copy file (Phase 2.5)
 ├── src/
 │   ├── data/
 │   │   ├── fetch.py             # yfinance data acquisition
 │   │   ├── validate.py          # Data quality checks
-│   │   └── storage.py           # Unified format loader + Parquet conversion
+│   │   └── storage.py           # Unified format loader + Parquet/Arrow conversion
 │   ├── portfolio/
 │   │   └── generator.py         # Seeded portfolio generator
 │   ├── compute/
-│   │   ├── baseline.py          # Pandas row-loop + NumPy matmul
-│   │   ├── numba_parallel.py    # Numba JIT kernel (Phase 3)
-│   │   └── cupy_gpu.py          # CuPy GPU engine (Phase 3)
+│   │   ├── baseline.py          # Pandas row-loop + NumPy matmul (Phase 1/2)
+│   │   ├── numba_parallel.py    # Numba JIT + prange, fastmath=True (Phase 3)
+│   │   ├── cpp_openmp.py        # ctypes → libportfolio_openmp.so (Phase 3)
+│   │   ├── cpp_eigen.py         # ctypes → libportfolio_eigen.so (Phase 3c)
+│   │   ├── rust_rayon.py        # ctypes → libportfolio_rayon.so (Phase 3)
+│   │   ├── rust_rayon_nightly.py # ctypes → libportfolio_rayon_nightly.so (Phase 3b)
+│   │   ├── rust_faer.py         # ctypes → libportfolio_faer.so (Phase 3c)
+│   │   ├── cupy_gpu.py          # CuPy GPU engine, graceful skip if no CUDA (Phase 3)
+│   │   ├── numpy_float32.py     # float32 matmul — memory-bandwidth experiment (Phase 3c)
+│   │   ├── pytorch_cpu.py       # PyTorch ATen matmul on CPU (Phase 3c)
+│   │   ├── jax_cpu.py           # JAX JIT-compiled kernel on CPU (Phase 3c)
+│   │   ├── polars_engine.py     # Polars expression API (Phase 3b)
+│   │   ├── duckdb_sql.py        # DuckDB SQL aggregation (Phase 3b)
+│   │   ├── fortran_openmp.py    # ctypes → libportfolio_fortran.so (Phase 3b)
+│   │   ├── julia_loopvec.py     # juliacall in-process Julia runtime (Phase 3b)
+│   │   ├── go_goroutines.py     # ctypes → libportfolio_go.so (Phase 3b)
+│   │   ├── java_vector_api.py   # JPype in-process JVM, Vector API (Phase 3b)
+│   │   ├── spark_local.py       # PySpark local cluster (Phase 4)
+│   │   ├── dask_local.py        # Dask local scheduler (Phase 4)
+│   │   └── ray_local.py         # Ray local cluster (Phase 4)
 │   └── benchmark/
 │       ├── runner.py            # Benchmark orchestration + telemetry
-│       └── report.py            # Results aggregation and reporting
+│       ├── report.py            # Results aggregation, print + CSV export
+│       └── db.py                # DuckDB result registry (ingest, dedupe, Parquet export)
 ├── implementations/
 │   ├── cpp/
-│   │   └── openmp/
-│   │       ├── CMakeLists.txt            # CMake build (requires cmake ≥3.16)
-│   │       ├── src/portfolio_compute.cpp # OpenMP + AVX2 kernel (-ffast-math)
-│   │       ├── build/                    # Build output (.so) — gitignored
-│   │       └── python/portfolio_openmp.py  # ctypes wrapper
-│   └── rust/
-│       └── rayon/
-│           ├── Cargo.toml                # cdylib crate, rayon = "1.10" (resolves 1.11.0)
-│           ├── .cargo/config.toml        # target-cpu=native (unlocks AVX2)
-│           ├── src/lib.rs                # Rayon + 8-wide accumulator kernel
-│           ├── target/                   # Cargo output — gitignored
-│           └── python/portfolio_rayon.py # ctypes wrapper
+│   │   ├── openmp/
+│   │   │   ├── CMakeLists.txt           # CMake build (-ffast-math, OpenMP)
+│   │   │   ├── src/portfolio_compute.cpp # OpenMP + AVX2 kernel
+│   │   │   ├── build/                   # Build output (libportfolio_openmp.so)
+│   │   │   └── python/portfolio_openmp.py
+│   │   └── eigen/
+│   │       ├── CMakeLists.txt           # CMake build (Eigen3 + OpenMP)
+│   │       ├── src/portfolio_compute.cpp # Eigen::Map + OpenMP
+│   │       ├── build/                   # Build output (libportfolio_eigen.so)
+│   │       └── python/portfolio_eigen.py
+│   ├── rust/
+│   │   ├── rayon/
+│   │   │   ├── Cargo.toml               # cdylib, rayon = "1.10"
+│   │   │   ├── .cargo/config.toml       # target-cpu=native (AVX2)
+│   │   │   ├── src/lib.rs               # 8-wide accumulator kernel
+│   │   │   ├── target/                  # Cargo output (libportfolio_rayon.so)
+│   │   │   └── python/portfolio_rayon.py
+│   │   ├── rayon_nightly/
+│   │   │   ├── Cargo.toml               # cdylib, nightly, fadd_fast
+│   │   │   ├── .cargo/config.toml       # target-cpu=native
+│   │   │   ├── src/lib.rs               # fadd_fast intrinsic kernel
+│   │   │   └── target/                  # (libportfolio_rayon_nightly.so)
+│   │   └── faer/
+│   │       ├── Cargo.toml               # cdylib, faer = "0.20", rayon
+│   │       ├── .cargo/config.toml       # target-cpu=native
+│   │       ├── src/lib.rs               # faer GEMM + Rayon Welford
+│   │       └── target/                  # (libportfolio_faer.so)
+│   ├── fortran/
+│   │   └── openmp/                      # FORTRAN ISO_C_BINDING + OpenMP
+│   ├── go/
+│   │   └── goroutines/                  # Go goroutine worker pool
+│   └── java/
+│       └── vector_api/                  # Java 21 Vector API + ForkJoinPool
 ├── scripts/
 │   ├── fetch_data.py            # CLI: download price data
 │   ├── generate_portfolios.py   # CLI: generate portfolio weight files
-│   ├── convert_to_parquet.py    # CLI: CSV → Parquet conversion
+│   ├── convert_to_parquet.py    # CLI: CSV → Parquet + Arrow IPC conversion
 │   ├── run_benchmark.py         # CLI: run benchmark configurations
-│   └── setup_phase3.sh          # One-shot Phase 3 environment setup
-├── results/                     # Benchmark outputs (JSON per run, summary.csv)
+│   ├── setup_phase3.sh          # One-shot Phase 3 environment setup
+│   └── setup_phase3b.sh         # One-shot Phase 3b environment setup
+├── results/
+│   ├── *.json                   # Individual run results (immutable source of truth)
+│   ├── registry.duckdb          # Queryable index of all run JSONs
+│   ├── summary.csv              # Flat table of all runs (backward-compat)
+│   ├── comparison.csv           # Throughput pivot (backward-compat)
+│   └── exports/
+│       ├── summary.parquet      # Publish-ready canonical dataset
+│       ├── telemetry.parquet    # Per-rep telemetry
+│       ├── summary.csv          # CSV version of summary
+│       └── comparison.csv       # Throughput pivot in CSV
 ├── common/
 │   └── schemas/
 │       └── benchmark_result.schema.json
@@ -362,14 +492,18 @@ agreement with NumPy's `ddof=1`. The `result_checksum` field in each result JSON
 (SHA-256 of the sorted results array) allows cross-implementation validation. Float
 differences at ~1e-14 are expected due to different FP operation ordering.
 
+The `numpy_float32` engine uses float32 for the matmul step (halving the L3 cache
+footprint) and upcasts to float64 before computing statistics; its checksum will
+differ from float64 engines by ~1e-6 and is documented in the result notes.
+
 ---
 
 ## Reproducibility
 
 - All randomness is seeded (`global_seed=42`, `portfolio_seed = (42 XOR id) & 0xFFFFFFFF`)
 - `data/raw/metadata/` is committed (universe list, data manifest, validation report)
-- `results/summary.csv` is committed; individual run JSONs are gitignored
-- `implementations/rust/rayon/Cargo.lock` is committed (pins exact dependency versions)
+- `results/summary.csv` and `results/exports/` are committed; individual run JSONs are gitignored
+- `implementations/rust/*/Cargo.lock` files are committed (pin exact dependency versions)
 - Build artefacts (`build/`, `target/`) are gitignored
 
 ---
@@ -382,4 +516,4 @@ If you use this benchmark in your research, please cite:
 [Citation to be added upon publication]
 ```
 
-See `RESEARCH.md` for the living research journal.
+See `RESEARCH.md` for the living research journal and `RESULTS.md` for detailed results.

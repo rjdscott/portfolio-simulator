@@ -31,13 +31,49 @@ python scripts/run_benchmark.py \
 
 # Full phase sweep (all configs in phase)
 python scripts/run_benchmark.py --phase 3
+python scripts/run_benchmark.py --phase 3b   # 7 extended engines
+python scripts/run_benchmark.py --phase 3c   # float32, PyTorch, JAX, Eigen, faer
 
 # Report only (no benchmark, just summarise existing results)
 python scripts/run_benchmark.py --report
 
+# Export publish-ready Parquet to results/exports/ (no benchmark run)
+python scripts/run_benchmark.py --export
+
 # Available scale values: 100, 1K, 100K, 1M, 100M, 1B
-# Available engines: numpy_vectorised, numba_parallel, cpp_openmp, rust_rayon, cupy_gpu
-# Available storage: csv_per_stock, csv_wide, parquet_wide_uncompressed, parquet_wide_snappy, parquet_wide_zstd
+# Available engines (Phase 1–3 core):
+#   numpy_vectorised, pandas_baseline, numba_parallel, cpp_openmp, rust_rayon, cupy_gpu
+# Available engines (Phase 3b — 7 additional):
+#   polars_engine, duckdb_sql, rust_rayon_nightly, fortran_openmp,
+#   julia_loopvec, go_goroutines, java_vector_api
+# Available engines (Phase 3c — float32 / alternative runtimes):
+#   numpy_float32, pytorch_cpu, jax_cpu, cpp_eigen, rust_faer
+# Available storage: csv_per_stock, csv_wide, parquet_wide_uncompressed,
+#                    parquet_wide_snappy, parquet_wide_zstd, parquet_per_stock, arrow_ipc
+```
+
+### DuckDB result registry
+```bash
+# Query the registry directly (read-only)
+python -c "
+from src.benchmark.db import get_connection
+con = get_connection()
+print(con.execute('SELECT implementation, portfolio_scale, ROUND(throughput,0) FROM v_canonical ORDER BY throughput DESC').df())
+"
+
+# Rebuild the registry from scratch (if registry.duckdb is deleted or corrupted)
+python -c "
+from src.benchmark.db import get_connection, ingest_all, export_parquet, export_csv
+con = get_connection()
+n = ingest_all(con=con)
+export_parquet(con=con); export_csv(con=con)
+print(f'Ingested {n} runs')
+"
+
+# Useful SQL views built into the registry:
+#   v_canonical   — all non-superseded rows (latest run per config fingerprint)
+#   v_phase3      — Phase 3 engines sorted by throughput
+#   v_speedup     — speedup relative to numpy_vectorised at each scale
 ```
 
 ### Data pipeline
@@ -111,6 +147,7 @@ Yahoo Finance → fetch_data.py → data/raw/prices/ (per-stock CSVs + prices_wi
 
 generate_portfolios.py        → data/raw/portfolios/portfolios_<N>.csv
 convert_to_parquet.py         → data/parquet/ (snappy / zstd / uncompressed variants)
+                              → data/parquet/prices_wide.arrow (Arrow IPC, zero-copy)
 
 scripts/run_benchmark.py
   └─ src/benchmark/runner.py (orchestration + telemetry)
@@ -118,14 +155,22 @@ scripts/run_benchmark.py
        ├─ src/compute/*.py      (engine implementations)
        └─ results/<uuid>.json   (persisted result + hardware/software metadata)
 
-scripts/run_benchmark.py --report
-  └─ src/benchmark/report.py   → results/summary.csv, comparison.csv, telemetry.csv
+scripts/run_benchmark.py --report  OR  --export
+  └─ src/benchmark/report.py
+       └─ src/benchmark/db.py   → results/registry.duckdb      (DuckDB registry)
+                                → results/exports/summary.parquet
+                                → results/exports/telemetry.parquet
+                                → results/exports/summary.csv
+                                → results/exports/comparison.csv
+                                → results/summary.csv           (backward compat)
+                                → results/comparison.csv        (backward compat)
+                                → results/telemetry.csv         (backward compat)
 ```
 
 ### Compute engines (`src/compute/`)
 All engines share the same interface: receive a `(T, U)` float64 returns matrix and a `(N, U)` float64/float32 weights matrix, return an `(N, 2)` float64 array of `[cumulative_return, annualised_sharpe]`.
 
-**Phase 1–3 engines (original — do not modify):**
+**Phase 1–3 engines (original):**
 
 | Module | Engine key | Notes |
 |--------|-----------|-------|
@@ -136,7 +181,7 @@ All engines share the same interface: receive a `(T, U)` float64 returns matrix 
 | `rust_rayon.py` | `rust_rayon` | ctypes → `libportfolio_rayon.so` (stable Rust) |
 | `cupy_gpu.py` | `cupy_gpu` | Optional; skipped gracefully if CUDA unavailable |
 
-**Phase 3b engines (new — 7 additional languages/runtimes):**
+**Phase 3b engines (7 additional languages/runtimes):**
 
 | Module | Engine key | Integration | Build/install required |
 |--------|-----------|-------------|------------------------|
@@ -148,7 +193,17 @@ All engines share the same interface: receive a `(T, U)` float64 returns matrix 
 | `go_goroutines.py` | `go_goroutines` | ctypes → `libportfolio_go.so` | `go build -buildmode=c-shared` |
 | `java_vector_api.py` | `java_vector_api` | JPype (in-process JVM) | `make -C implementations/java/vector_api build` |
 
-The Numba kernel warms up on first call (~30 s); `cache=True` skips on subsequent runs. Julia and Java JVMs start once per process — the existing warmup run handles JIT compilation.
+**Phase 3c engines (float32 and alternative runtimes):**
+
+| Module | Engine key | Integration | Build/install required |
+|--------|-----------|-------------|------------------------|
+| `numpy_float32.py` | `numpy_float32` | Pure Python (NumPy) | None (in core deps) |
+| `pytorch_cpu.py` | `pytorch_cpu` | Pure Python (PyTorch) | `uv pip install torch --index-url https://download.pytorch.org/whl/cpu` |
+| `jax_cpu.py` | `jax_cpu` | Pure Python (JAX JIT) | `uv pip install "jax[cpu]"` |
+| `cpp_eigen.py` | `cpp_eigen` | ctypes → `libportfolio_eigen.so` | `sudo apt install libeigen3-dev` + cmake |
+| `rust_faer.py` | `rust_faer` | ctypes → `libportfolio_faer.so` | `cargo build --release` (stable) |
+
+The Numba kernel warms up on first call (~30 s); `cache=True` skips recompilation on subsequent runs. Julia and Java JVMs start once per process — the existing warmup run handles JIT compilation. JAX JIT compilation occurs on first call and is amortised by the warmup rep.
 
 ### Benchmark runner (`src/benchmark/runner.py`)
 - `run_benchmark(config)` is the main entry point. It runs `reps` repetitions, records per-rep telemetry (CPU%, I/O MB, RSS), and writes a result JSON to `results/<uuid>.json`.
@@ -166,12 +221,22 @@ Reproducible seeding: portfolio `i` uses seed `(42 XOR i) & 0xFFFFFFFF`. K=15 st
 - **C++ (`-ffast-math` is critical):** Without it, GCC treats the FP reduction as non-associative and emits scalar code. The `#pragma omp simd reduction(+:port_r)` directive on the inner loop plus `-ffast-math -funroll-loops` unlocks AVX2 FMA. All pointers are `__restrict__`.
 - **Rust (8-wide accumulators):** Rust stable has no `-ffast-math` equivalent. The workaround is 8 independent accumulator variables per inner loop so LLVM can pack them into two ymm registers. `.cargo/config.toml` sets `target-cpu = native` to enable AVX2/FMA at the instruction level.
 
+### DuckDB result registry (`src/benchmark/db.py`)
+- `results/registry.duckdb` — DuckDB file; **derived artefact**, can be deleted and rebuilt
+- `results/<uuid>.json` — **immutable source of truth**; never modify after writing
+- `ingest_all()` is incremental: checks `json_path UNIQUE` to skip already-ingested files
+- `config_fingerprint` = SHA-256 of `(implementation, storage_format, scale, k, seed, cpu_model)`
+- Re-running a config marks the old row `superseded=TRUE`; `v_canonical` always shows latest
+- `--report` and `--export` both call `ingest_all()` + export automatically
+- DuckDB `INSERT OR REPLACE` fails when a table has multiple UNIQUE constraints — use plain
+  `INSERT INTO` and rely on the `ingest_all()` incremental guard instead
+
 ## Key conventions
 
 - **Package manager:** `uv` only (not pip/pip3).
 - **Engine name alias:** `"numpy_vectorised"` and `"numpy_matmul"` refer to the same engine in `runner.py`.
 - **Scale shorthands:** CLI accepts `100`, `1K`, `100K`, `1M`, `100M`, `1B`; internally stored as integers.
 - **N > 10M:** Portfolio weights are generated on-the-fly (seeded, not materialised on disk).
-- **Metrics definition:** cumulative return = `expm1(Σ log_returns @ weights)`; Sharpe = `mean(daily_port_ret) / std(ddof=1) × sqrt(252)` with Rf=0.
+- **Metrics definition (canonical):** `cum_ret = expm1(port_returns.sum(axis=1))` where `port_returns = weights @ returns.T` (returns are already log-returns). Sharpe = `mean / std(ddof=1) × sqrt(252)`. Do NOT apply `log1p` again.
 - **Results schema:** `common/schemas/benchmark_result.schema.json` is the authoritative spec for the result JSON structure.
-- **Committed vs. generated:** Raw price/portfolio CSVs and Parquet files are **not committed** (generated locally). Only `data/raw/metadata/` (universe.csv, manifests) and `results/summary.csv` are committed.
+- **Committed vs. generated:** Raw price/portfolio CSVs and Parquet files are **not committed** (generated locally). Only `data/raw/metadata/` (universe.csv, manifests), `results/summary.csv`, and `results/exports/` are committed.

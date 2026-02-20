@@ -151,8 +151,15 @@ def _infer_phase(implementation: str, storage: str) -> str:
     if implementation in ("spark_local", "dask_local", "ray_local"):
         return "4_distributed"
     # Phase 3 compute engines — regardless of storage format
-    if implementation in ("numba_parallel", "cupy_gpu", "cpp_openmp",
-                          "cpp_blas", "rust_rayon", "rust_ndarray"):
+    if implementation in (
+        "numba_parallel", "cupy_gpu",
+        "cpp_openmp", "cpp_blas", "cpp_eigen",
+        "cpp_openmp_unroll", "cpp_openmp_tile4", "cpp_openmp_clang",
+        "rust_rayon", "rust_rayon_nightly", "rust_ndarray", "rust_faer",
+        "fortran_openmp", "julia_loopvec", "go_goroutines", "java_vector_api",
+        "polars_engine", "duckdb_sql",
+        "pytorch_cpu", "jax_cpu", "numpy_float32",
+    ):
         return "3_compute_opt"
     # Phase 2 storage formats (numpy_vectorised engine on parquet/arrow/hdf5)
     if "parquet" in storage or "arrow" in storage or "hdf5" in storage:
@@ -332,9 +339,21 @@ def print_summary(df: pd.DataFrame, tel_df: pd.DataFrame) -> None:
 
 def run() -> None:
     """Load all results, write CSVs, print report."""
+    # Incrementally ingest any new JSON result files into the DuckDB registry
+    try:
+        from src.benchmark.db import get_connection, ingest_all, export_csv, export_parquet
+        con = get_connection()
+        n_new = ingest_all(con=con)
+        if n_new:
+            log.info(f"Ingested {n_new} new run(s) into registry.duckdb")
+    except Exception as e:
+        log.warning(f"DuckDB registry update skipped: {e}")
+        con = None
+
     df, tel_df = load_all_results()
     print_summary(df, tel_df)
 
+    # Legacy CSVs in results/ (backward compat)
     if not df.empty:
         df.to_csv(RESULTS_DIR / "summary.csv", index=False)
         log.info(f"summary.csv written ({len(df)} rows)")
@@ -350,6 +369,16 @@ def run() -> None:
             log.info("comparison.csv written")
         except Exception as e:
             log.warning(f"Could not write comparison.csv: {e}")
+
+    # Publish-ready exports to results/exports/
+    if con is not None:
+        try:
+            export_csv(con=con)
+            export_parquet(con=con)
+        except Exception as e:
+            log.warning(f"Export to results/exports/ skipped: {e}")
+        finally:
+            con.close()
 
 
 if __name__ == "__main__":
